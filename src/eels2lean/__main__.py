@@ -31,16 +31,16 @@ from .translate import (
 )
 
 
-def write_modules(out: Path, sources: dict[str, str]) -> None:
+def write_modules(out: Path, sources: dict[str, str], root: str) -> None:
     """Write one Lean file per module and the umbrella module."""
     for module, source in sources.items():
-        path = out.joinpath(LEAN_ROOT, *module.split(".")).with_suffix(".lean")
+        path = out.joinpath(root, *module.split(".")).with_suffix(".lean")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source)
     umbrella = "".join(
-        f"import {lean_module_name(m)}\n" for m in sorted(sources)
+        f"import {lean_module_name(m, root)}\n" for m in sorted(sources)
     )
-    (out / f"{LEAN_ROOT}.lean").write_text(umbrella)
+    (out / f"{root}.lean").write_text(umbrella)
 
 
 def write_check(out: Path, t: Translator, functions: list[str]) -> None:
@@ -119,6 +119,8 @@ def main() -> int:
                         help="directory holding the `ethereum` package")
     parser.add_argument("--out", type=Path, help="Lean project directory")
     parser.add_argument("--pin", default="unknown", help="EELS commit")
+    parser.add_argument("--root", default=LEAN_ROOT,
+                        help="root Lean module for the generated files")
     parser.add_argument("--check", action="store_true",
                         help="also write the differential check")
     parser.add_argument("--survey", metavar="MODULE")
@@ -135,15 +137,15 @@ def main() -> int:
     try:
         for fq in args.functions:
             t.require(fq)
-        sources = render(t.items, args.pin)
+        sources = render(t.items, args.pin, args.root)
     except Unsupported as error:
         print(f"unsupported: {error}", file=sys.stderr)
         return 1
-    write_modules(args.out, sources)
+    write_modules(args.out, sources, args.root)
     if args.check:
         write_check(args.out, t, args.functions)
     for module in sorted(sources):
-        print(f"wrote {lean_module_name(module)}")
+        print(f"wrote {lean_module_name(module, args.root)}")
     return 0
 
 
