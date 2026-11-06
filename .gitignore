@@ -3,3 +3,9 @@ __pycache__/
 *.egg-info/
 dist/
 .DS_Store
+.cache/
+lean/.lake/
+lean/Eels/
+lean/Eels.lean
+lean/EelsCheck.lean
+lean/eels-check.json

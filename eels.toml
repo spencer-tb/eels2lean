@@ -1,0 +1,3 @@
+# The EELS commit eels2lean translates and checks against.
+ref = "ethereum/forks/amsterdam"
+commit = "16898000911c1e3caa57be08509536c10ae92d3e"

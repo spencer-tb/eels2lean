@@ -1,0 +1,830 @@
+"""
+Translate EELS functions, and everything they reference, into Lean 4.
+
+The translator reads EELS source with `ast`. It starts from the requested
+functions and follows every name they use to its definition, across
+modules. Each EELS module becomes one Lean module, and each definition
+keeps its EELS name inside a namespace equal to its EELS module path.
+
+Anything outside the supported subset raises `Unsupported`, naming the file
+and line. The translator never guesses.
+"""
+
+import ast
+from dataclasses import dataclass, field
+from pathlib import Path
+
+RUNTIME = "EelsRuntime"
+LEAN_ROOT = "Eels"
+
+# Types from `ethereum_types.numeric`, mapped to runtime types.
+NUMERIC = {
+    "ethereum_types.numeric.Uint": "Uint",
+    "ethereum_types.numeric.U64": "U64",
+    "ethereum_types.numeric.U256": "U256",
+}
+FIXED_BITS = {"U64": 64, "U256": 256}
+BUILTIN_TYPES = {"int": "Int", "bool": "Bool"}
+LEAN_TYPES = {"Uint": "Uint", "U64": "U64", "U256": "U256", **BUILTIN_TYPES}
+
+LEAN_KEYWORDS = {
+    "at", "by", "calc", "class", "def", "do", "else", "end", "example",
+    "export", "fun", "have", "if", "import", "in", "instance", "let",
+    "match", "mutual", "namespace", "open", "section", "show", "structure",
+    "then", "theorem", "universe", "variable", "where", "with", "from",
+}
+
+
+class Unsupported(Exception):
+    """A Python construct the translator does not handle."""
+
+
+def ident(name: str) -> str:
+    """Return `name` as a Lean identifier, escaping keywords."""
+    return f"«{name}»" if name in LEAN_KEYWORDS else name
+
+
+@dataclass
+class Module:
+    """One parsed EELS module."""
+
+    name: str
+    path: Path
+    tree: ast.Module
+    is_package: bool
+    imports: dict[str, str] = field(default_factory=dict)
+    defs: dict[str, ast.stmt] = field(default_factory=dict)
+
+    def where(self, node: ast.AST) -> str:
+        """Return `file:line` for `node`."""
+        return f"{self.path}:{getattr(node, 'lineno', '?')}"
+
+
+@dataclass
+class Item:
+    """One Lean declaration to emit."""
+
+    fq: str
+    module: str
+    lean: str
+    deps: set[str]
+
+
+@dataclass
+class Constant:
+    """A translated constant, and whether reading it can raise."""
+
+    lean_type: str
+    py_type: str
+    failable: bool
+
+
+@dataclass
+class Signature:
+    """Parameter and return types of a translated function."""
+
+    params: list[tuple[str, str]]
+    returns: str
+
+
+class Project:
+    """All EELS modules under a source root, loaded on demand."""
+
+    def __init__(self, src: Path) -> None:
+        self.src = src
+        self.modules: dict[str, Module] = {}
+
+    def module(self, name: str) -> Module | None:
+        """Load the module called `name`, or return `None`."""
+        if name in self.modules:
+            return self.modules[name]
+        base = self.src.joinpath(*name.split("."))
+        for path, is_package in (
+            (base.with_suffix(".py"), False),
+            (base / "__init__.py", True),
+        ):
+            if path.is_file():
+                tree = ast.parse(path.read_text(), filename=str(path))
+                module = Module(name, path, tree, is_package)
+                self._index(module)
+                self.modules[name] = module
+                return module
+        return None
+
+    def _index(self, module: Module) -> None:
+        package = (
+            module.name
+            if module.is_package
+            else module.name.rpartition(".")[0]
+        )
+        for stmt in self._top_level(module.tree.body):
+            if isinstance(stmt, ast.ImportFrom):
+                if stmt.level:
+                    parts = package.split(".")
+                    parts = parts[: len(parts) - (stmt.level - 1)]
+                    origin = ".".join(parts + ([stmt.module] if stmt.module else []))
+                else:
+                    origin = stmt.module or ""
+                for alias in stmt.names:
+                    module.imports[alias.asname or alias.name] = (
+                        f"{origin}.{alias.name}"
+                    )
+            elif isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    module.imports[alias.asname or alias.name] = alias.name
+            elif isinstance(stmt, (ast.FunctionDef, ast.ClassDef)):
+                module.defs[stmt.name] = stmt
+            elif isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        module.defs[target.id] = stmt
+            elif isinstance(stmt, ast.AnnAssign):
+                if isinstance(stmt.target, ast.Name):
+                    module.defs[stmt.target.id] = stmt
+
+    @staticmethod
+    def _top_level(body: list[ast.stmt]) -> list[ast.stmt]:
+        """Flatten `if TYPE_CHECKING:` blocks into the top level."""
+        out: list[ast.stmt] = []
+        for stmt in body:
+            if (
+                isinstance(stmt, ast.If)
+                and isinstance(stmt.test, ast.Name)
+                and stmt.test.id == "TYPE_CHECKING"
+            ):
+                out.extend(stmt.body)
+            else:
+                out.append(stmt)
+        return out
+
+    def resolve(self, fq: str) -> tuple[Module, list[str]] | None:
+        """
+        Find the module that defines `fq`, following re-exports.
+
+        Return the module and the remaining attribute path.
+        """
+        parts = fq.split(".")
+        for cut in range(len(parts) - 1, 0, -1):
+            module = self.module(".".join(parts[:cut]))
+            if module is None:
+                continue
+            rest = parts[cut:]
+            if rest[0] in module.defs:
+                return module, rest
+            if rest[0] in module.imports:
+                target = module.imports[rest[0]]
+                return self.resolve(".".join([target, *rest[1:]]))
+            return None
+        return None
+
+
+class Translator:
+    """Translate a closure of EELS definitions into Lean modules."""
+
+    def __init__(self, project: Project) -> None:
+        self.project = project
+        self.items: dict[str, Item] = {}
+        self.constants: dict[str, Constant] = {}
+        self.signatures: dict[str, Signature] = {}
+        self.aliases: dict[str, str] = {}
+        self.in_progress: set[str] = set()
+
+    # Names and types.
+
+    def global_fq(self, module: Module, name: str) -> str | None:
+        """Return the fully qualified name `name` refers to in `module`."""
+        if name in module.defs:
+            return f"{module.name}.{name}"
+        if name in module.imports:
+            return module.imports[name]
+        return None
+
+    def py_type(self, module: Module, node: ast.expr | None) -> str:
+        """Translate a type annotation into a Python type key."""
+        if node is None:
+            raise Unsupported(f"{module.where(module.tree)}: missing annotation")
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "Final"
+        ):
+            return self.py_type(module, node.slice)
+        if isinstance(node, ast.Name):
+            if node.id in BUILTIN_TYPES:
+                return node.id
+            fq = self.global_fq(module, node.id)
+            if fq in NUMERIC:
+                return NUMERIC[fq]
+            if fq is not None:
+                self.require(fq)
+                fq = self.canonical(fq)
+                if fq in self.aliases:
+                    return fq
+        raise Unsupported(
+            f"{module.where(node)}: type annotation {ast.unparse(node)}"
+        )
+
+    def base(self, py_type: str) -> str:
+        """Follow `NewType` aliases down to a runtime type."""
+        while py_type in self.aliases:
+            py_type = self.aliases[py_type]
+        return py_type
+
+    def lean_type(self, py_type: str) -> str:
+        """Return the Lean name of a Python type key."""
+        if py_type in LEAN_TYPES:
+            return LEAN_TYPES[py_type]
+        return py_type
+
+    def canonical(self, fq: str) -> str:
+        """Return the defining path of `fq`, following re-exports."""
+        found = self.project.resolve(fq)
+        if found is None:
+            return fq
+        module, rest = found
+        return ".".join([module.name, *rest])
+
+    # The closure.
+
+    def require(self, fq: str) -> None:
+        """Translate the definition `fq` and everything it needs."""
+        if fq in self.items or fq in self.in_progress or fq in NUMERIC:
+            return
+        found = self.project.resolve(fq)
+        if found is None:
+            raise Unsupported(f"cannot find the definition of {fq}")
+        module, rest = found
+        fq = ".".join([module.name, *rest])
+        if fq in self.items or fq in self.in_progress:
+            return
+        self.in_progress.add(fq)
+        try:
+            node = module.defs[rest[0]]
+            if len(rest) == 2 and isinstance(node, ast.ClassDef):
+                item = self.class_constant(module, node, rest[1])
+            elif len(rest) == 1 and isinstance(node, ast.FunctionDef):
+                item = FunctionTranslator(self, module, node).translate()
+            elif len(rest) == 1 and isinstance(node, ast.Assign):
+                item = self.module_assign(module, node, rest[0])
+            else:
+                raise Unsupported(f"{module.where(node)}: definition of {fq}")
+        finally:
+            self.in_progress.discard(fq)
+        self.items[fq] = item
+
+    def module_assign(self, module: Module, node: ast.Assign, name: str) -> Item:
+        """Translate `X = NewType("X", Base)`."""
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and self.global_fq(module, call.func.id) == "typing.NewType"
+            and len(call.args) == 2
+        ):
+            base = self.py_type(module, call.args[1])
+            fq = f"{module.name}.{name}"
+            self.aliases[fq] = base
+            lean = f"/-- `{name} = NewType(\"{name}\", ...)` -/\nabbrev {ident(name)} := {self.lean_type(base)}\n"
+            return Item(fq, module.name, lean, self.type_deps(base))
+        raise Unsupported(f"{module.where(node)}: module-level {name}")
+
+    def type_deps(self, py_type: str) -> set[str]:
+        """Return the declarations a type key depends on."""
+        return {py_type} if py_type in self.aliases else set()
+
+    def class_constant(self, module: Module, cls: ast.ClassDef, name: str) -> Item:
+        """Translate one annotated constant in a constants class."""
+        for stmt in cls.body:
+            if (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.target.id == name
+                and stmt.value is not None
+            ):
+                break
+        else:
+            raise Unsupported(f"{module.where(cls)}: {cls.name}.{name}")
+        fq = f"{module.name}.{cls.name}.{name}"
+        py_type = self.py_type(module, stmt.annotation)
+        scope = ClassScope(cls, {
+            s.target.id
+            for s in cls.body
+            if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name)
+        })
+        expr = ExprTranslator(self, module, {}, scope)
+        value = expr.expr(stmt.value)
+        lean_type = self.lean_type(py_type)
+        failable = "←" in value
+        short = f"{cls.name}.{name}"
+        if failable:
+            lean = (
+                f"/-- `{short}` -/\n"
+                f"def {cls.name}.{ident(name)} : Except Exc {lean_type} := do\n"
+                f"  return {value}\n"
+            )
+        else:
+            lean = (
+                f"/-- `{short}` -/\n"
+                f"def {cls.name}.{ident(name)} : {lean_type} :=\n  {value}\n"
+            )
+        self.constants[fq] = Constant(lean_type, py_type, failable)
+        return Item(fq, module.name, lean, expr.deps | self.type_deps(py_type))
+
+
+@dataclass
+class ClassScope:
+    """Names visible inside a constants class body."""
+
+    cls: ast.ClassDef
+    names: set[str]
+
+
+class ExprTranslator:
+    """Translate expressions inside one function or constant."""
+
+    def __init__(
+        self,
+        translator: Translator,
+        module: Module,
+        locals_: dict[str, str],
+        scope: ClassScope | None = None,
+    ) -> None:
+        self.t = translator
+        self.module = module
+        self.locals = locals_
+        self.scope = scope
+        self.deps: set[str] = set()
+
+    def fail(self, node: ast.AST, what: str) -> Unsupported:
+        return Unsupported(f"{self.module.where(node)}: {what}: {ast.unparse(node)}")
+
+    # Types of expressions.
+
+    def type_of(self, node: ast.expr) -> str:
+        """Return the Python type key of `node`."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return "bool"
+            if isinstance(node.value, int):
+                return "int"
+        if isinstance(node, ast.Name):
+            if node.id in self.locals:
+                return self.locals[node.id]
+            fq = self.ref_fq(node)
+            if fq is not None and fq not in NUMERIC:
+                self.t.require(fq)
+            if fq in self.t.constants:
+                return self.t.constants[fq].py_type
+        if isinstance(node, ast.Attribute):
+            fq = self.attr_fq(node)
+            if fq is not None:
+                self.t.require(fq)
+            if fq in self.t.constants:
+                return self.t.constants[fq].py_type
+        if isinstance(node, ast.BinOp):
+            left = self.type_of(node.left)
+            right = self.type_of(node.right)
+            if self.t.base(left) != self.t.base(right):
+                raise self.fail(node, f"mixed operand types {left} and {right}")
+            return left
+        if isinstance(node, (ast.Compare, ast.BoolOp)):
+            return "bool"
+        if isinstance(node, ast.UnaryOp):
+            return "bool" if isinstance(node.op, ast.Not) else self.type_of(node.operand)
+        if isinstance(node, ast.IfExp):
+            return self.type_of(node.body)
+        if isinstance(node, ast.Call):
+            return self.call_type(node)
+        raise self.fail(node, "cannot type")
+
+    def call_type(self, node: ast.Call) -> str:
+        """Return the Python type key of a call's result."""
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+            if name == "int":
+                return "int"
+            if name in ("min", "max"):
+                return self.type_of(node.args[0])
+            fq = self.ref_fq(node.func)
+            if fq in NUMERIC:
+                return NUMERIC[fq]
+            if fq is not None:
+                self.t.require(fq)
+                fq = self.canonical(fq)
+                if fq in self.t.aliases:
+                    return fq
+                if fq in self.t.signatures:
+                    return self.t.signatures[fq].returns
+        raise self.fail(node, "cannot type call")
+
+    # Name resolution.
+
+    def canonical(self, fq: str) -> str:
+        found = self.t.project.resolve(fq)
+        if found is None:
+            return fq
+        module, rest = found
+        return ".".join([module.name, *rest])
+
+    def ref_fq(self, node: ast.Name) -> str | None:
+        if self.scope is not None and node.id in self.scope.names:
+            return f"{self.module.name}.{self.scope.cls.name}.{node.id}"
+        fq = self.t.global_fq(self.module, node.id)
+        if fq in NUMERIC or fq is None:
+            return fq
+        return self.canonical(fq)
+
+    def attr_fq(self, node: ast.Attribute) -> str | None:
+        if isinstance(node.value, ast.Name) and node.value.id not in self.locals:
+            base = self.t.global_fq(self.module, node.value.id)
+            if base is not None:
+                return self.canonical(f"{base}.{node.attr}")
+        return None
+
+    def lean_ref(self, fq: str) -> str:
+        """Return a Lean reference to the declaration `fq`."""
+        self.t.require(fq)
+        self.deps.add(fq)
+        return ".".join(ident(p) for p in fq.split("."))
+
+    # Expressions.
+
+    def expr(self, node: ast.expr) -> str:
+        """Return Lean for `node`, lifting raising calls with `←`."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return "true" if node.value else "false"
+            if isinstance(node.value, int) and node.value >= 0:
+                return str(node.value)
+            raise self.fail(node, "constant")
+        if isinstance(node, ast.Name):
+            if node.id in self.locals:
+                return ident(node.id)
+            fq = self.ref_fq(node)
+            if fq is not None:
+                return self.constant_ref(node, fq)
+            raise self.fail(node, "unknown name")
+        if isinstance(node, ast.Attribute):
+            fq = self.attr_fq(node)
+            if fq is not None:
+                return self.constant_ref(node, fq)
+            raise self.fail(node, "attribute")
+        if isinstance(node, ast.BinOp):
+            return self.binop(node)
+        if isinstance(node, ast.Compare):
+            return self.compare(node)
+        if isinstance(node, ast.BoolOp):
+            op = " && " if isinstance(node.op, ast.And) else " || "
+            parts = [self.expr(v) for v in node.values]
+            if any("←" in p for p in parts[1:]):
+                raise self.fail(node, "raising operand after a short circuit")
+            return "(" + op.join(parts) + ")"
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return f"(!{self.expr(node.operand)})"
+        if isinstance(node, ast.IfExp):
+            body, orelse = self.expr(node.body), self.expr(node.orelse)
+            if "←" in body or "←" in orelse:
+                raise self.fail(node, "raising branch in a conditional expression")
+            return f"(if {self.expr(node.test)} then {body} else {orelse})"
+        if isinstance(node, ast.Call):
+            return self.call(node)
+        raise self.fail(node, "expression")
+
+    def constant_ref(self, node: ast.expr, fq: str) -> str:
+        ref = self.lean_ref(fq)
+        if fq in self.t.constants:
+            return f"(← {ref})" if self.t.constants[fq].failable else ref
+        raise self.fail(node, f"reference to {fq}")
+
+    def binop(self, node: ast.BinOp) -> str:
+        kind = self.t.base(self.type_of(node))
+        left, right = self.expr(node.left), self.expr(node.right)
+        op = type(node.op)
+        if kind == "Uint":
+            pure = {ast.Add: "+", ast.Mult: "*", ast.Pow: "^"}
+            if op in pure:
+                return f"({left} {pure[op]} {right})"
+            if op in (ast.FloorDiv, ast.Mod):
+                symbol = "/" if op is ast.FloorDiv else "%"
+                if self.nonzero_literal(node.right):
+                    return f"({left} {symbol} {right})"
+                name = "floorDiv" if op is ast.FloorDiv else "mod"
+                return f"(← {RUNTIME}.Uint.{name} {left} {right})"
+            if op is ast.Sub:
+                return f"(← {RUNTIME}.Uint.sub {left} {right})"
+        if kind in FIXED_BITS:
+            names = {
+                ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul",
+                ast.FloorDiv: "floorDiv", ast.Mod: "mod", ast.Pow: "pow",
+            }
+            if op in names:
+                return f"(← {RUNTIME}.Fixed.{names[op]} {left} {right})"
+        if kind == "int":
+            pure = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*"}
+            if op in pure:
+                return f"({left} {pure[op]} {right})"
+            if op in (ast.FloorDiv, ast.Mod):
+                name = "floorDiv" if op is ast.FloorDiv else "mod"
+                return f"(← {RUNTIME}.Int.{name} {left} {right})"
+        raise self.fail(node, f"operator {op.__name__} on {kind}")
+
+    @staticmethod
+    def nonzero_literal(node: ast.expr) -> bool:
+        """Return whether `node` is `Uint(n)` or `n` for a literal `n > 0`."""
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and len(node.args) == 1
+        ):
+            node = node.args[0]
+        return (
+            isinstance(node, ast.Constant)
+            and type(node.value) is int
+            and node.value > 0
+        )
+
+    def compare(self, node: ast.Compare) -> str:
+        if len(node.ops) != 1:
+            raise self.fail(node, "chained comparison")
+        symbols = {
+            ast.Eq: "=", ast.NotEq: "≠", ast.Lt: "<",
+            ast.LtE: "≤", ast.Gt: ">", ast.GtE: "≥",
+        }
+        op = type(node.ops[0])
+        if op not in symbols:
+            raise self.fail(node, "comparison")
+        left = self.type_of(node.left)
+        right = self.type_of(node.comparators[0])
+        if self.t.base(left) != self.t.base(right):
+            raise self.fail(node, f"comparison of {left} and {right}")
+        return (
+            f"(decide ({self.expr(node.left)} {symbols[op]} "
+            f"{self.expr(node.comparators[0])}))"
+        )
+
+    def call(self, node: ast.Call) -> str:
+        if node.keywords or not isinstance(node.func, ast.Name):
+            raise self.fail(node, "call")
+        name = node.func.id
+        args = node.args
+        if name in ("min", "max") and len(args) == 2:
+            return f"({name} {self.expr(args[0])} {self.expr(args[1])})"
+        if name == "int" and len(args) == 1:
+            kind = self.t.base(self.type_of(args[0]))
+            inner = self.expr(args[0])
+            if kind == "Uint":
+                return f"(Int.ofNat {inner})"
+            if kind in FIXED_BITS:
+                return f"(Int.ofNat {inner}.val)"
+            if kind == "int":
+                return inner
+            raise self.fail(node, "int() argument")
+        fq = self.ref_fq(node.func)
+        if fq in NUMERIC and len(args) == 1:
+            return self.construct(node, NUMERIC[fq], args[0])
+        if fq is None:
+            raise self.fail(node, "unknown function")
+        self.t.require(fq)
+        fq = self.canonical(fq)
+        if fq in self.t.aliases and len(args) == 1:
+            target = self.t.base(fq)
+            if self.t.base(self.type_of(args[0])) != target:
+                raise self.fail(node, f"{fq} of a non-{target}")
+            self.deps.add(fq)
+            return self.expr(args[0])
+        if fq in self.t.signatures:
+            ref = self.lean_ref(fq)
+            rendered = " ".join(self.expr(a) for a in args)
+            return f"(← {ref} {rendered})"
+        raise self.fail(node, "call target")
+
+    def construct(self, node: ast.Call, kind: str, arg: ast.expr) -> str:
+        """Translate `Uint(x)`, `U64(x)` or `U256(x)`."""
+        source = self.t.base(self.type_of(arg))
+        inner = self.expr(arg)
+        if kind == "Uint":
+            if isinstance(arg, ast.Constant) or source == "Uint":
+                return f"({inner} : Uint)"
+            if source in FIXED_BITS:
+                return f"{inner}.val"
+            if source == "int":
+                return f"(← {RUNTIME}.Uint.ofInt {inner})"
+        bits = FIXED_BITS[kind] if kind in FIXED_BITS else None
+        if bits is not None:
+            if isinstance(arg, ast.Constant) or source == "Uint":
+                return f"(← {RUNTIME}.Fixed.ofNat {bits} {inner})"
+            if source in FIXED_BITS:
+                return f"(← {RUNTIME}.Fixed.ofNat {bits} {inner}.val)"
+            if source == "int":
+                return f"(← {RUNTIME}.Fixed.ofInt {bits} {inner})"
+        raise self.fail(node, f"{kind}() of {source}")
+
+
+class FunctionTranslator:
+    """Translate one EELS function into a Lean `def`."""
+
+    def __init__(self, t: Translator, module: Module, node: ast.FunctionDef) -> None:
+        self.t = t
+        self.module = module
+        self.node = node
+        self.locals: dict[str, str] = {}
+        self.mutable: set[str] = set()
+        self.declared: set[str] = set()
+        self.expr = ExprTranslator(t, module, self.locals)
+
+    def fail(self, node: ast.AST, what: str) -> Unsupported:
+        return Unsupported(f"{self.module.where(node)}: {what}")
+
+    def translate(self) -> Item:
+        node = self.node
+        fq = f"{self.module.name}.{node.name}"
+        if node.decorator_list or node.args.vararg or node.args.kwarg:
+            raise self.fail(node, f"signature of {node.name}")
+        if node.args.kwonlyargs or node.args.defaults or node.args.posonlyargs:
+            raise self.fail(node, f"signature of {node.name}")
+        params = []
+        for arg in node.args.args:
+            py_type = self.t.py_type(self.module, arg.annotation)
+            params.append((arg.arg, py_type))
+            self.locals[arg.arg] = py_type
+            self.declared.add(arg.arg)
+        returns = self.t.py_type(self.module, node.returns)
+        self.t.signatures[fq] = Signature(params, returns)
+        self.mutable = self.find_mutable(node.body)
+        body = self.block(self.strip_docstring(node.body), 1)
+        rendered = " ".join(
+            f"({ident(name)} : {self.t.lean_type(t)})" for name, t in params
+        )
+        doc = f"/-- `{node.name}` from `{self.module.name}` -/\n"
+        lean = (
+            f"{doc}def {ident(node.name)} {rendered} : "
+            f"Except Exc {self.t.lean_type(returns)} := do\n{body}"
+        )
+        deps = set(self.expr.deps)
+        for _, py_type in params:
+            deps |= self.t.type_deps(py_type)
+        deps |= self.t.type_deps(returns)
+        return Item(fq, self.module.name, lean, deps)
+
+    @staticmethod
+    def strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            return body[1:]
+        return body
+
+    def find_mutable(self, body: list[ast.stmt]) -> set[str]:
+        """Return names assigned more than once or inside nested blocks."""
+        counts: dict[str, int] = {}
+        nested: set[str] = set()
+
+        def visit(stmts: list[ast.stmt], depth: int) -> None:
+            for stmt in stmts:
+                for name in self.assigned(stmt):
+                    counts[name] = counts.get(name, 0) + 1
+                    if depth > 0:
+                        nested.add(name)
+                for child in ("body", "orelse"):
+                    if hasattr(stmt, child) and not isinstance(stmt, ast.FunctionDef):
+                        visit(getattr(stmt, child), depth + 1)
+
+        visit(body, 0)
+        return {n for n, c in counts.items() if c > 1} | nested
+
+    @staticmethod
+    def assigned(stmt: ast.stmt) -> list[str]:
+        if isinstance(stmt, ast.Assign):
+            return [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+        if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)) and isinstance(
+            stmt.target, ast.Name
+        ):
+            return [stmt.target.id]
+        return []
+
+    def block(self, stmts: list[ast.stmt], depth: int) -> str:
+        if not stmts:
+            return "  " * depth + "pure ()\n"
+        return "".join(self.stmt(s, depth) for s in stmts)
+
+    def stmt(self, node: ast.stmt, depth: int) -> str:
+        pad = "  " * depth
+        if isinstance(node, ast.Pass):
+            return ""
+        if isinstance(node, ast.Return):
+            if node.value is None:
+                return f"{pad}return ()\n"
+            return f"{pad}return {self.expr.expr(node.value)}\n"
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                raise self.fail(node, "assignment target")
+            if node.value is None:
+                raise self.fail(node, "annotation without a value")
+            return self.assign(node, targets[0].id, node.value, depth)
+        if isinstance(node, ast.AugAssign):
+            if not isinstance(node.target, ast.Name):
+                raise self.fail(node, "augmented assignment target")
+            value = ast.BinOp(
+                left=ast.Name(node.target.id, ast.Load()),
+                op=node.op,
+                right=node.value,
+            )
+            ast.copy_location(value, node)
+            ast.fix_missing_locations(value)
+            return self.assign(node, node.target.id, value, depth)
+        if isinstance(node, ast.If):
+            test = self.expr.expr(node.test)
+            out = f"{pad}if {test} then\n{self.block(node.body, depth + 1)}"
+            if node.orelse:
+                out += f"{pad}else\n{self.block(node.orelse, depth + 1)}"
+            return out
+        if isinstance(node, ast.Raise):
+            return f"{pad}throw ⟨\"{self.exception_name(node)}\"⟩\n"
+        if isinstance(node, ast.Assert):
+            test = self.expr.expr(node.test)
+            return f"{pad}if !{test} then\n{pad}  throw ⟨\"AssertionError\"⟩\n"
+        raise self.fail(node, f"statement {type(node).__name__}")
+
+    def assign(self, node: ast.stmt, name: str, value: ast.expr, depth: int) -> str:
+        pad = "  " * depth
+        py_type = self.expr.type_of(value)
+        if name in self.locals and self.t.base(self.locals[name]) != self.t.base(py_type):
+            raise self.fail(node, f"{name} changes type")
+        rendered = self.expr.expr(value)
+        if name in self.declared:
+            if name not in self.mutable:
+                raise self.fail(node, f"reassignment of {name}")
+            return f"{pad}{ident(name)} := {rendered}\n"
+        if depth > 1:
+            raise self.fail(node, f"{name} first assigned inside a block")
+        self.locals[name] = py_type
+        self.declared.add(name)
+        keyword = "let mut" if name in self.mutable else "let"
+        return f"{pad}{keyword} {ident(name)} := {rendered}\n"
+
+    def exception_name(self, node: ast.Raise) -> str:
+        exc = node.exc
+        if isinstance(exc, ast.Call):
+            exc = exc.func
+        if isinstance(exc, ast.Name):
+            return exc.id
+        raise self.fail(node, "raise")
+
+
+def order(items: dict[str, Item]) -> list[Item]:
+    """Order items so every declaration follows its dependencies."""
+    done: set[str] = set()
+    out: list[Item] = []
+
+    def visit(fq: str, stack: tuple[str, ...]) -> None:
+        if fq in done or fq not in items:
+            return
+        if fq in stack:
+            raise Unsupported(f"recursive definitions: {' -> '.join(stack + (fq,))}")
+        for dep in sorted(items[fq].deps):
+            visit(dep, stack + (fq,))
+        done.add(fq)
+        out.append(items[fq])
+
+    for fq in sorted(items):
+        visit(fq, ())
+    return out
+
+
+def lean_module_name(module: str) -> str:
+    return f"{LEAN_ROOT}.{module}"
+
+
+def render(items: dict[str, Item], pin: str) -> dict[str, str]:
+    """Return Lean source per EELS module."""
+    by_module: dict[str, list[Item]] = {}
+    for item in order(items):
+        by_module.setdefault(item.module, []).append(item)
+    out: dict[str, str] = {}
+    for module, module_items in by_module.items():
+        imports = {
+            items[dep].module
+            for item in module_items
+            for dep in item.deps
+            if dep in items and items[dep].module != module
+        }
+        lines = [f"import {RUNTIME}"]
+        lines += [f"import {lean_module_name(m)}" for m in sorted(imports)]
+        header = (
+            f"/-!\nGenerated by eels2lean from `{module}` at EELS {pin}.\n"
+            f"Do not edit.\n-/\n"
+        )
+        body = "\n".join(i.lean for i in module_items)
+        out[module] = (
+            "\n".join(lines)
+            + "\n\n"
+            + header
+            + f"\nnamespace {module}\nopen {RUNTIME}\n\n"
+            + body
+            + f"\nend {module}\n"
+        )
+    return out

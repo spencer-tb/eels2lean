@@ -4,7 +4,25 @@ Translate the
 [Ethereum Execution Layer Specification (EELS)](https://github.com/ethereum/execution-specs)
 from Python into [Lean 4](https://lean-lang.org).
 
-**Status:** not started. The package is empty.
+**Status:** stage 1 started, pinned to EELS `forks/amsterdam` at
+`1689800091` (see `eels.toml`). `max_message_call_gas`,
+`calculate_memory_gas_cost`, `init_code_cost` and `ceil32` translate,
+compile, and match EELS on about 2,000 boundary and random inputs each.
+
+## Usage
+
+Needs [uv](https://docs.astral.sh/uv/), [just](https://just.systems),
+[elan](https://github.com/leanprover/elan) and an EELS checkout with its
+virtual environment (`EELS`, default `~/ethereum/execution-specs`).
+
+```sh
+just check                                     # translate, build, compare with EELS
+just survey ethereum.forks.amsterdam.vm.gas    # what translates, and why the rest does not
+```
+
+The Lean runtime in `lean/EelsRuntime.lean` gives Python's
+`ethereum_types` arithmetic its meaning, written by hand. Generated files
+under `lean/Eels/` are not committed.
 
 ## Why
 
