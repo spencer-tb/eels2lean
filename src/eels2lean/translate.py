@@ -187,6 +187,7 @@ class Translator:
         self.constants: dict[str, Constant] = {}
         self.signatures: dict[str, Signature] = {}
         self.aliases: dict[str, str] = {}
+        self.records: dict[str, list[tuple[str, str]]] = {}
         self.in_progress: set[str] = set()
 
     # Names and types.
@@ -218,7 +219,7 @@ class Translator:
             if fq is not None:
                 self.require(fq)
                 fq = self.canonical(fq)
-                if fq in self.aliases:
+                if fq in self.aliases or fq in self.records:
                     return fq
         raise Unsupported(
             f"{module.where(node)}: type annotation {ast.unparse(node)}"
@@ -264,6 +265,8 @@ class Translator:
                 item = self.class_constant(module, node, rest[1])
             elif len(rest) == 1 and isinstance(node, ast.FunctionDef):
                 item = FunctionTranslator(self, module, node).translate()
+            elif len(rest) == 1 and isinstance(node, ast.ClassDef):
+                item = self.record(module, node)
             elif len(rest) == 1 and isinstance(node, ast.Assign):
                 item = self.module_assign(module, node, rest[0])
             else:
@@ -290,7 +293,43 @@ class Translator:
 
     def type_deps(self, py_type: str) -> set[str]:
         """Return the declarations a type key depends on."""
-        return {py_type} if py_type in self.aliases else set()
+        if py_type in self.aliases or py_type in self.records:
+            return {py_type}
+        return set()
+
+    def record(self, module: Module, cls: ast.ClassDef) -> Item:
+        """Translate a `@dataclass` with only annotated fields."""
+        decorators = [
+            self.global_fq(module, d.id)
+            for d in cls.decorator_list
+            if isinstance(d, ast.Name)
+        ]
+        if len(decorators) != len(cls.decorator_list) or (
+            "dataclasses.dataclass" not in decorators
+        ) or not set(decorators) <= {"dataclasses.dataclass", "typing.final"}:
+            raise Unsupported(f"{module.where(cls)}: class {cls.name}")
+        if cls.bases or cls.keywords:
+            raise Unsupported(f"{module.where(cls)}: base classes of {cls.name}")
+        fields: list[tuple[str, str]] = []
+        for stmt in FunctionTranslator.strip_docstring(cls.body):
+            if (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.value is None
+            ):
+                fields.append((stmt.target.id, self.py_type(module, stmt.annotation)))
+            else:
+                raise Unsupported(f"{module.where(stmt)}: body of {cls.name}")
+        fq = f"{module.name}.{cls.name}"
+        self.records[fq] = fields
+        rendered = "".join(
+            f"  {ident(n)} : {self.lean_type(t)}\n" for n, t in fields
+        )
+        lean = f"/-- `@dataclass {cls.name}` -/\nstructure {ident(cls.name)} where\n{rendered}"
+        deps: set[str] = set()
+        for _, t in fields:
+            deps |= self.type_deps(t)
+        return Item(fq, module.name, lean, deps)
 
     def class_constant(self, module: Module, cls: ast.ClassDef, name: str) -> Item:
         """Translate one annotated constant in a constants class."""
@@ -376,6 +415,9 @@ class ExprTranslator:
             if fq in self.t.constants:
                 return self.t.constants[fq].py_type
         if isinstance(node, ast.Attribute):
+            field = self.record_field(node)
+            if field is not None:
+                return field
             fq = self.attr_fq(node)
             if fq is not None:
                 self.t.require(fq)
@@ -411,11 +453,21 @@ class ExprTranslator:
             if fq is not None:
                 self.t.require(fq)
                 fq = self.canonical(fq)
-                if fq in self.t.aliases:
+                if fq in self.t.aliases or fq in self.t.records:
                     return fq
                 if fq in self.t.signatures:
                     return self.t.signatures[fq].returns
         raise self.fail(node, "cannot type call")
+
+    def record_field(self, node: ast.Attribute) -> str | None:
+        """Return the type of `local.field` for a local dataclass value."""
+        if isinstance(node.value, ast.Name) and node.value.id in self.locals:
+            kind = self.locals[node.value.id]
+            for name, py_type in self.t.records.get(kind, []):
+                if name == node.attr:
+                    return py_type
+            raise self.fail(node, "attribute of a local")
+        return None
 
     # Name resolution.
 
@@ -465,6 +517,8 @@ class ExprTranslator:
                 return self.constant_ref(node, fq)
             raise self.fail(node, "unknown name")
         if isinstance(node, ast.Attribute):
+            if self.record_field(node) is not None:
+                return f"{ident(node.value.id)}.{ident(node.attr)}"
             fq = self.attr_fq(node)
             if fq is not None:
                 return self.constant_ref(node, fq)
@@ -553,14 +607,23 @@ class ExprTranslator:
         op = type(node.ops[0])
         if op not in symbols:
             raise self.fail(node, "comparison")
-        left = self.type_of(node.left)
-        right = self.type_of(node.comparators[0])
-        if self.t.base(left) != self.t.base(right):
-            raise self.fail(node, f"comparison of {left} and {right}")
-        return (
-            f"(decide ({self.expr(node.left)} {symbols[op]} "
-            f"{self.expr(node.comparators[0])}))"
-        )
+        lhs, rhs = node.left, node.comparators[0]
+        left = self.t.base(self.type_of(lhs))
+        right = self.t.base(self.type_of(rhs))
+        rendered_l, rendered_r = self.expr(lhs), self.expr(rhs)
+        if left != right:
+            # `Unsigned.__eq__` and friends compare with an `int` numerically.
+            literal = lambda n: isinstance(n, ast.Constant) and type(n.value) is int
+            numeric = ("Uint", *FIXED_BITS)
+            if literal(rhs) and left in numeric and op in (ast.Eq, ast.NotEq):
+                rendered_l = f"{rendered_l}.val" if left in FIXED_BITS else rendered_l
+            elif literal(lhs) and right in numeric and op in (ast.Eq, ast.NotEq):
+                rendered_r = f"{rendered_r}.val" if right in FIXED_BITS else rendered_r
+            else:
+                raise self.fail(node, f"comparison of {left} and {right}")
+        elif left in FIXED_BITS:
+            rendered_l, rendered_r = f"{rendered_l}.val", f"{rendered_r}.val"
+        return f"(decide ({rendered_l} {symbols[op]} {rendered_r}))"
 
     def call(self, node: ast.Call) -> str:
         if node.keywords or not isinstance(node.func, ast.Name):
@@ -592,6 +655,16 @@ class ExprTranslator:
                 raise self.fail(node, f"{fq} of a non-{target}")
             self.deps.add(fq)
             return self.expr(args[0])
+        if fq in self.t.records:
+            fields = self.t.records[fq]
+            if len(args) != len(fields):
+                raise self.fail(node, f"{fq} needs {len(fields)} arguments")
+            for arg, (_, py_type) in zip(args, fields):
+                if self.t.base(self.type_of(arg)) != self.t.base(py_type):
+                    raise self.fail(node, f"argument type for {fq}")
+            ref = self.lean_ref(fq)
+            rendered = " ".join(self.expr(a) for a in args)
+            return f"({ref}.mk {rendered})"
         if fq in self.t.signatures:
             ref = self.lean_ref(fq)
             rendered = " ".join(self.expr(a) for a in args)
@@ -630,6 +703,8 @@ class FunctionTranslator:
         self.locals: dict[str, str] = {}
         self.mutable: set[str] = set()
         self.declared: set[str] = set()
+        self.params: set[str] = set()
+        self.shadowed: set[str] = set()
         self.expr = ExprTranslator(t, module, self.locals)
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
@@ -640,7 +715,7 @@ class FunctionTranslator:
         fq = f"{self.module.name}.{node.name}"
         if node.decorator_list or node.args.vararg or node.args.kwarg:
             raise self.fail(node, f"signature of {node.name}")
-        if node.args.kwonlyargs or node.args.defaults or node.args.posonlyargs:
+        if node.args.kwonlyargs or node.args.posonlyargs:
             raise self.fail(node, f"signature of {node.name}")
         params = []
         for arg in node.args.args:
@@ -648,12 +723,29 @@ class FunctionTranslator:
             params.append((arg.arg, py_type))
             self.locals[arg.arg] = py_type
             self.declared.add(arg.arg)
+            self.params.add(arg.arg)
+        defaults: dict[str, str] = {}
+        firsts = len(params) - len(node.args.defaults)
+        for (name, py_type), value in zip(params[firsts:], node.args.defaults):
+            if self.t.base(self.expr.type_of(value)) != self.t.base(py_type):
+                raise self.fail(value, f"default of {name}")
+            rendered_default = self.expr.expr(value)
+            if "←" in rendered_default:
+                raise self.fail(value, f"raising default of {name}")
+            defaults[name] = rendered_default
         returns = self.t.py_type(self.module, node.returns)
         self.t.signatures[fq] = Signature(params, returns)
         self.mutable = self.find_mutable(node.body)
-        body = self.block(self.strip_docstring(node.body), 1)
+        prologue = "".join(
+            f"  let mut {ident(n)} := {ident(n)}\n"
+            for n, _ in params
+            if n in self.mutable
+        )
+        body = prologue + self.block(self.strip_docstring(node.body), 1)
         rendered = " ".join(
-            f"({ident(name)} : {self.t.lean_type(t)})" for name, t in params
+            f"({ident(name)} : {self.t.lean_type(t)}"
+            + (f" := {defaults[name]})" if name in defaults else ")")
+            for name, t in params
         )
         doc = f"/-- `{node.name}` from `{self.module.name}` -/\n"
         lean = (
@@ -756,9 +848,13 @@ class FunctionTranslator:
             raise self.fail(node, f"{name} changes type")
         rendered = self.expr.expr(value)
         if name in self.declared:
-            if name not in self.mutable:
-                raise self.fail(node, f"reassignment of {name}")
-            return f"{pad}{ident(name)} := {rendered}\n"
+            if name in self.mutable:
+                return f"{pad}{ident(name)} := {rendered}\n"
+            if name in self.params and name not in self.shadowed and depth == 1:
+                # A parameter assigned once at the top level: shadow it.
+                self.shadowed.add(name)
+                return f"{pad}let {ident(name)} := {rendered}\n"
+            raise self.fail(node, f"reassignment of {name}")
         if depth > 1:
             raise self.fail(node, f"{name} first assigned inside a block")
         self.locals[name] = py_type

@@ -1,7 +1,7 @@
 pin := `grep '^commit' eels.toml | cut -d'"' -f2`
 eels := env("EELS", home_directory() / "ethereum/execution-specs")
 src := ".cache/eels" / pin / "src"
-functions := "ethereum.forks.amsterdam.vm.gas.max_message_call_gas ethereum.forks.amsterdam.vm.gas.calculate_memory_gas_cost ethereum.forks.amsterdam.vm.gas.init_code_cost ethereum.utils.numeric.ceil32"
+functions := "ethereum.forks.amsterdam.vm.gas.max_message_call_gas ethereum.forks.amsterdam.vm.gas.calculate_memory_gas_cost ethereum.forks.amsterdam.vm.gas.init_code_cost ethereum.utils.numeric.ceil32 ethereum.forks.amsterdam.vm.gas.calculate_message_call_gas"
 
 # Copy the pinned EELS commit into .cache/eels/<commit>.
 snapshot:

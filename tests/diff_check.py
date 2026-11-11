@@ -39,13 +39,19 @@ def inputs(arity: int, rng: random.Random, count: int) -> list[tuple[int, ...]]:
     return cases
 
 
-def run_python(function: str, args: tuple[int, ...]) -> str:
-    from ethereum_types.numeric import Uint
+def run_python(entry: dict, args: tuple[int, ...]) -> str:
+    from ethereum_types import numeric
 
-    module_name, _, name = function.rpartition(".")
+    module_name, _, name = entry["function"].rpartition(".")
     fn = getattr(importlib.import_module(module_name), name)
     try:
-        return f"ok {int(fn(*(Uint(a) for a in args)))}"
+        values = [
+            getattr(numeric, p["kind"])(a) for p, a in zip(entry["params"], args)
+        ]
+        result = fn(*values)
+        fields = entry["fields"]
+        numbers = [getattr(result, f) for f in fields] if fields else [result]
+        return "ok " + " ".join(str(int(n)) for n in numbers)
     except Exception as error:  # noqa: BLE001, every exception is a result
         return f"err {type(error).__name__}"
 
@@ -67,7 +73,7 @@ def main() -> int:
     for entry in manifest:
         function = entry["function"]
         cases = inputs(len(entry["params"]), rng, args.random)
-        expected = [run_python(function, c) for c in cases]
+        expected = [run_python(entry, c) for c in cases]
         stdin = "".join(
             f"{function} {' '.join(map(str, c))}\n" for c in cases
         )

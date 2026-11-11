@@ -47,30 +47,56 @@ def write_check(out: Path, t: Translator, functions: list[str]) -> None:
     """
     Write `EelsCheck.lean` and `eels-check.json`.
 
-    Only functions whose parameters and result are all `Uint`-based take
-    part, because the check passes plain numbers.
+    A function takes part when its parameters are `Uint`, `U64` or `U256`
+    based, and its result is `Uint` based or a dataclass of `Uint` based
+    fields. The check passes plain numbers and prints the result's numbers.
     """
-    checked = []
-    for fq in functions:
-        sig = t.signatures[t.canonical(fq)]
-        kinds = [t.base(p) for _, p in sig.params] + [t.base(sig.returns)]
-        if all(k == "Uint" for k in kinds):
-            checked.append((t.canonical(fq), [n for n, _ in sig.params]))
+    numeric = {"Uint", "U64", "U256"}
+    bits = {"U64": 64, "U256": 256}
     arms = []
-    for fq, params in checked:
-        names = [f"a{i}" for i in range(len(params))]
+    manifest = []
+    for fq in functions:
+        fq = t.canonical(fq)
+        sig = t.signatures[fq]
+        kinds = [t.base(p) for _, p in sig.params]
+        result = t.base(sig.returns)
+        if result in t.records:
+            fields = [n for n, ft in t.records[result] if t.base(ft) == "Uint"]
+            if len(fields) != len(t.records[result]):
+                continue
+        elif result == "Uint":
+            fields = None
+        else:
+            continue
+        if not all(k in numeric for k in kinds):
+            continue
+        names = [f"a{i}" for i in range(len(kinds))]
+        lines = []
+        args = []
+        for i, kind in enumerate(kinds):
+            if kind in bits:
+                lines.append(f"let v{i} ← EelsRuntime.Fixed.ofNat {bits[kind]} a{i}")
+                args.append(f"v{i}")
+            else:
+                args.append(f"a{i}")
         ref = ".".join(ident(p) for p in fq.split("."))
-        call = " ".join([ref, *names])
-        arms.append(
-            f'  | "{fq}", [{", ".join(names)}] => some ({call})'
-        )
+        lines.append(f"let r ← {ref} {' '.join(args)}")
+        values = ", ".join(f"r.{ident(f)}" for f in fields) if fields else "r"
+        lines.append(f"return [{values}]")
+        body = "".join(f"\n      {line}" for line in lines)
+        arms.append(f'  | "{fq}", [{", ".join(names)}] => some (do{body})')
+        manifest.append({
+            "function": fq,
+            "params": [{"name": n, "kind": k} for (n, _), k in zip(sig.params, kinds)],
+            "fields": fields,
+        })
     source = (
         f"import {LEAN_ROOT}\nopen EelsRuntime\n\n"
         "/-- Call a generated function by name on natural numbers. -/\n"
-        "def callFn : String → List Nat → Option (Except Exc Nat)\n"
+        "def callFn : String → List Nat → Option (Except Exc (List Nat))\n"
         + "\n".join(arms)
         + "\n  | _, _ => none\n\n"
-        "/-- Read `name arg...` lines, print `ok value` or `err Exception`. -/\n"
+        "/-- Read `name arg...` lines, print `ok value...` or `err Exception`. -/\n"
         "def main : IO Unit := do\n"
         "  let stdin ← IO.getStdin\n"
         "  let stdout ← IO.getStdout\n"
@@ -80,13 +106,12 @@ def write_check(out: Path, t: Translator, functions: list[str]) -> None:
         "    match (line.trimAscii.toString.splitOn \" \") with\n"
         "    | name :: args =>\n"
         "      match callFn name (args.filterMap String.toNat?) with\n"
-        "      | some (.ok v) => stdout.putStrLn s!\"ok {v}\"\n"
+        "      | some (.ok vs) => stdout.putStrLn (\"ok \" ++ \" \".intercalate (vs.map toString))\n"
         "      | some (.error e) => stdout.putStrLn s!\"err {e.name}\"\n"
         "      | none => stdout.putStrLn \"unknown\"\n"
         "    | [] => pure ()\n"
     )
     (out / "EelsCheck.lean").write_text(source)
-    manifest = [{"function": fq, "params": params} for fq, params in checked]
     (out / "eels-check.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
