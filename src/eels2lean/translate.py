@@ -6,6 +6,10 @@ functions and follows every name they use to its definition, across
 modules. Each EELS module becomes one Lean module, and each definition
 keeps its EELS name inside a namespace equal to its EELS module path.
 
+A function that only computes returns `Except Exc α`. A function that
+assigns to a field of a dataclass parameter returns `EStateM Exc σ α`, with
+that parameter as the state `σ`, so a write made before a raise is kept.
+
 Anything outside the supported subset raises `Unsupported`, naming the file
 and line. The translator never guesses.
 """
@@ -25,11 +29,16 @@ NUMERIC = {
 }
 FIXED_BITS = {"U64": 64, "U256": 256}
 BUILTIN_TYPES = {"int": "Int", "bool": "Bool"}
-LEAN_TYPES = {"Uint": "Uint", "U64": "U64", "U256": "U256", **BUILTIN_TYPES}
+LEAN_TYPES = {
+    "Uint": "Uint", "U64": "U64", "U256": "U256", "None": "Unit",
+    **BUILTIN_TYPES,
+}
 
 # Exception classes with a constructor in the runtime's `Exc`. Keep the two
 # in step: the Lean build fails on a name the runtime does not have.
-EXCEPTIONS = ("AssertionError", "OverflowError", "ZeroDivisionError")
+EXCEPTIONS = (
+    "AssertionError", "OverflowError", "ZeroDivisionError", "OutOfGasError",
+)
 
 LEAN_KEYWORDS = {
     "at", "by", "calc", "class", "def", "do", "else", "end", "example",
@@ -85,34 +94,40 @@ class Constant:
 
 @dataclass
 class Signature:
-    """Parameter and return types of a translated function."""
+    """
+    Parameter and return types of a translated function.
+
+    `state` names the dataclass parameter the function changes, if any.
+    """
 
     params: list[tuple[str, str]]
     returns: str
+    state: str | None = None
 
 
 class Project:
-    """All EELS modules under a source root, loaded on demand."""
+    """All modules under the source roots, loaded on demand."""
 
-    def __init__(self, src: Path) -> None:
-        self.src = src
+    def __init__(self, *srcs: Path) -> None:
+        self.srcs = srcs
         self.modules: dict[str, Module] = {}
 
     def module(self, name: str) -> Module | None:
         """Load the module called `name`, or return `None`."""
         if name in self.modules:
             return self.modules[name]
-        base = self.src.joinpath(*name.split("."))
-        for path, is_package in (
-            (base.with_suffix(".py"), False),
-            (base / "__init__.py", True),
-        ):
-            if path.is_file():
-                tree = ast.parse(path.read_text(), filename=str(path))
-                module = Module(name, path, tree, is_package)
-                self._index(module)
-                self.modules[name] = module
-                return module
+        for src in self.srcs:
+            base = src.joinpath(*name.split("."))
+            for path, is_package in (
+                (base.with_suffix(".py"), False),
+                (base / "__init__.py", True),
+            ):
+                if path.is_file():
+                    tree = ast.parse(path.read_text(), filename=str(path))
+                    module = Module(name, path, tree, is_package)
+                    self._index(module)
+                    self.modules[name] = module
+                    return module
         return None
 
     def _index(self, module: Module) -> None:
@@ -302,7 +317,7 @@ class Translator:
         return set()
 
     def record(self, module: Module, cls: ast.ClassDef) -> Item:
-        """Translate a `@dataclass` with only annotated fields."""
+        """Translate a `@dataclass` of annotated fields, with their defaults."""
         decorators = [
             self.global_fq(module, d.id)
             for d in cls.decorator_list
@@ -315,22 +330,39 @@ class Translator:
         if cls.bases or cls.keywords:
             raise Unsupported(f"{module.where(cls)}: base classes of {cls.name}")
         fields: list[tuple[str, str]] = []
-        for stmt in FunctionTranslator.strip_docstring(cls.body):
+        rendered = ""
+        expr = ExprTranslator(self, module, {})
+        for stmt in cls.body:
             if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                # The docstring of the class or of the field above.
+                continue
+            if not (
                 isinstance(stmt, ast.AnnAssign)
                 and isinstance(stmt.target, ast.Name)
-                and stmt.value is None
             ):
-                fields.append((stmt.target.id, self.py_type(module, stmt.annotation)))
-            else:
                 raise Unsupported(f"{module.where(stmt)}: body of {cls.name}")
+            name = stmt.target.id
+            py_type = self.py_type(module, stmt.annotation)
+            default = ""
+            if stmt.value is not None:
+                if self.base(expr.type_of(stmt.value)) != self.base(py_type):
+                    raise Unsupported(f"{module.where(stmt)}: default of {name}")
+                value = expr.expr(stmt.value)
+                if "←" in value:
+                    raise Unsupported(
+                        f"{module.where(stmt)}: raising default of {name}"
+                    )
+                default = f" := {value}"
+            fields.append((name, py_type))
+            rendered += f"  {ident(name)} : {self.lean_type(py_type)}{default}\n"
         fq = f"{module.name}.{cls.name}"
         self.records[fq] = fields
-        rendered = "".join(
-            f"  {ident(n)} : {self.lean_type(t)}\n" for n, t in fields
-        )
         lean = f"/-- `@dataclass {cls.name}` -/\nstructure {ident(cls.name)} where\n{rendered}"
-        deps: set[str] = set()
+        deps = set(expr.deps)
         for _, t in fields:
             deps |= self.type_deps(t)
         return Item(fq, module.name, lean, deps)
@@ -396,6 +428,7 @@ class ExprTranslator:
         self.module = module
         self.locals = locals_
         self.scope = scope
+        self.state: str | None = None
         self.deps: set[str] = set()
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
@@ -514,6 +547,10 @@ class ExprTranslator:
                 return str(node.value)
             raise self.fail(node, "constant")
         if isinstance(node, ast.Name):
+            if node.id == self.state:
+                # Only its fields are read: a second name for the dataclass
+                # would not see later writes.
+                raise self.fail(node, "the changed dataclass used as a value")
             if node.id in self.locals:
                 return ident(node.id)
             fq = self.ref_fq(node)
@@ -670,6 +707,8 @@ class ExprTranslator:
             rendered = " ".join(self.expr(a) for a in args)
             return f"({ref}.mk {rendered})"
         if fq in self.t.signatures:
+            if self.t.signatures[fq].state is not None:
+                raise self.fail(node, "call to a function that changes its argument")
             ref = self.lean_ref(fq)
             rendered = " ".join(self.expr(a) for a in args)
             return f"(← {ref} {rendered})"
@@ -710,6 +749,15 @@ class FunctionTranslator:
         self.params: set[str] = set()
         self.shadowed: set[str] = set()
         self.expr = ExprTranslator(t, module, self.locals)
+        # The dataclass parameter the function changes, if any.
+        self.state: str | None = None
+        # Writes to the state on the path so far, and per open block the
+        # count at which the block last read the state into a local.
+        self.writes = 0
+        self.snapshots: list[int | None] = []
+        # Open blocks, innermost last, and the names local to each.
+        self.blocks: list[list[ast.stmt]] = []
+        self.block_locals: list[set[str]] = []
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
         return Unsupported(f"{self.module.where(node)}: {what}")
@@ -737,8 +785,12 @@ class FunctionTranslator:
             if "←" in rendered_default:
                 raise self.fail(value, f"raising default of {name}")
             defaults[name] = rendered_default
-        returns = self.t.py_type(self.module, node.returns)
-        self.t.signatures[fq] = Signature(params, returns)
+        if isinstance(node.returns, ast.Constant) and node.returns.value is None:
+            returns = "None"
+        else:
+            returns = self.t.py_type(self.module, node.returns)
+        self.state = self.expr.state = self.find_state(params)
+        self.t.signatures[fq] = Signature(params, returns, self.state)
         self.mutable = self.find_mutable(node.body)
         prologue = "".join(
             f"  let mut {ident(n)} := {ident(n)}\n"
@@ -746,15 +798,24 @@ class FunctionTranslator:
             if n in self.mutable
         )
         body = prologue + self.block(self.strip_docstring(node.body), 1)
-        rendered = " ".join(
-            f"({ident(name)} : {self.t.lean_type(t)}"
+        rendered = "".join(
+            f" ({ident(name)} : {self.t.lean_type(t)}"
             + (f" := {defaults[name]})" if name in defaults else ")")
             for name, t in params
+            if name != self.state
         )
-        doc = f"/-- `{node.name}` from `{self.module.name}` -/\n"
+        if self.state is None:
+            monad = "Except Exc"
+            doc = f"/-- `{node.name}` from `{self.module.name}` -/\n"
+        else:
+            monad = f"EStateM Exc {self.t.lean_type(self.locals[self.state])}"
+            doc = (
+                f"/-- `{node.name}` from `{self.module.name}`. "
+                f"The state is `{self.state}`. -/\n"
+            )
         lean = (
-            f"{doc}def {ident(node.name)} {rendered} : "
-            f"Except Exc {self.t.lean_type(returns)} := do\n{body}"
+            f"{doc}def {ident(node.name)}{rendered} : "
+            f"{monad} {self.t.lean_type(returns)} := do\n{body}"
         )
         deps = set(self.expr.deps)
         for _, py_type in params:
@@ -772,6 +833,30 @@ class FunctionTranslator:
         ):
             return body[1:]
         return body
+
+    def find_state(self, params: list[tuple[str, str]]) -> str | None:
+        """Return the dataclass parameter whose fields the function assigns."""
+        records = {name for name, t in params if t in self.t.records}
+        changed = sorted({
+            n.value.id
+            for n in ast.walk(self.node)
+            if isinstance(n, ast.Attribute)
+            and isinstance(n.ctx, ast.Store)
+            and isinstance(n.value, ast.Name)
+            and n.value.id in records
+        })
+        if len(changed) > 1:
+            raise self.fail(
+                self.node, f"changes more than one dataclass: {', '.join(changed)}"
+            )
+        return changed[0] if changed else None
+
+    def reads_state(self, node: ast.stmt) -> bool:
+        """Return whether `node` itself, not a block inside it, names the state."""
+        root = node.test if isinstance(node, ast.If) else node
+        return any(
+            isinstance(n, ast.Name) and n.id == self.state for n in ast.walk(root)
+        )
 
     def find_mutable(self, body: list[ast.stmt]) -> set[str]:
         """Return names assigned more than once or inside nested blocks."""
@@ -804,9 +889,42 @@ class FunctionTranslator:
     def block(self, stmts: list[ast.stmt], depth: int) -> str:
         if not stmts:
             return "  " * depth + "pure ()\n"
-        return "".join(self.stmt(s, depth) for s in stmts)
+        self.blocks.append(stmts)
+        self.block_locals.append(set())
+        self.snapshots.append(None)
+        try:
+            return "".join(self.stmt(s, depth) for s in stmts)
+        finally:
+            self.snapshots.pop()
+            self.blocks.pop()
+            for name in self.block_locals.pop():
+                del self.locals[name]
+                self.declared.discard(name)
+
+    def read(self, depth: int) -> str:
+        """
+        Return the line that reads the state into a local of its own name.
+
+        Field reads then look as they do in Python. The line is empty when
+        a read still in scope is current: nothing was written since.
+        """
+        if self.writes in self.snapshots:
+            return ""
+        self.snapshots[-1] = self.writes
+        return f"{'  ' * depth}let {ident(self.state)} ← get\n"
 
     def stmt(self, node: ast.stmt, depth: int) -> str:
+        """Translate one statement, reading the state first if it names it."""
+        target = getattr(node, "target", None) or getattr(node, "targets", [None])[0]
+        if (
+            self.state is None
+            or isinstance(target, ast.Attribute)
+            or not self.reads_state(node)
+        ):
+            return self.statement(node, depth)
+        return self.read(depth) + self.statement(node, depth)
+
+    def statement(self, node: ast.stmt, depth: int) -> str:
         pad = "  " * depth
         if isinstance(node, ast.Pass):
             return ""
@@ -816,27 +934,38 @@ class FunctionTranslator:
             return f"{pad}return {self.expr.expr(node.value)}\n"
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            if len(targets) != 1:
                 raise self.fail(node, "assignment target")
             if node.value is None:
                 raise self.fail(node, "annotation without a value")
+            if isinstance(targets[0], ast.Attribute):
+                return self.store(node, targets[0], node.value, depth)
+            if not isinstance(targets[0], ast.Name):
+                raise self.fail(node, "assignment target")
             return self.assign(node, targets[0].id, node.value, depth)
         if isinstance(node, ast.AugAssign):
-            if not isinstance(node.target, ast.Name):
+            target = node.target
+            if isinstance(target, ast.Attribute):
+                left: ast.expr = ast.Attribute(target.value, target.attr, ast.Load())
+            elif isinstance(target, ast.Name):
+                left = ast.Name(target.id, ast.Load())
+            else:
                 raise self.fail(node, "augmented assignment target")
-            value = ast.BinOp(
-                left=ast.Name(node.target.id, ast.Load()),
-                op=node.op,
-                right=node.value,
-            )
+            value = ast.BinOp(left=left, op=node.op, right=node.value)
             ast.copy_location(value, node)
             ast.fix_missing_locations(value)
-            return self.assign(node, node.target.id, value, depth)
+            if isinstance(target, ast.Attribute):
+                return self.store(node, target, value, depth)
+            return self.assign(node, target.id, value, depth)
         if isinstance(node, ast.If):
             test = self.expr.expr(node.test)
+            before = self.writes
             out = f"{pad}if {test} then\n{self.block(node.body, depth + 1)}"
             if node.orelse:
+                # The other branch starts from the state the test saw.
+                after, self.writes = self.writes, before
                 out += f"{pad}else\n{self.block(node.orelse, depth + 1)}"
+                self.writes = max(after, self.writes)
             return out
         if isinstance(node, ast.Raise):
             return f"{pad}throw Exc.{self.exception_name(node)}\n"
@@ -845,8 +974,44 @@ class FunctionTranslator:
             return f"{pad}if !{test} then\n{pad}  throw Exc.AssertionError\n"
         raise self.fail(node, f"statement {type(node).__name__}")
 
+    def store(
+        self, node: ast.stmt, target: ast.Attribute, value: ast.expr, depth: int
+    ) -> str:
+        """
+        Translate `state.field = value`.
+
+        A value that cannot raise is computed from the state as it is at the
+        write. One that can is computed first, from a read of the state, so
+        that a raise leaves the state alone.
+        """
+        if not (isinstance(target.value, ast.Name) and target.value.id == self.state):
+            raise self.fail(node, "assignment target")
+        field = self.expr.record_field(target)
+        if self.t.base(field) != self.t.base(self.expr.type_of(value)):
+            raise self.fail(node, f"{target.attr} changes type")
+        rendered = self.expr.expr(value)
+        pad = "  " * depth
+        state = ident(self.state)
+        update = f"{{ {state} with {ident(target.attr)} := {rendered} }}"
+        if "←" in rendered:
+            out = f"{self.read(depth)}{pad}set {update}\n"
+        else:
+            out = f"{pad}modify fun {state} => {update}\n"
+        self.writes += 1
+        return out
+
+    def names(self, stmts: list[ast.stmt], name: str) -> int:
+        """Count the places in `stmts` that read or assign `name`."""
+        return sum(
+            isinstance(n, ast.Name) and n.id == name
+            for stmt in stmts
+            for n in ast.walk(stmt)
+        )
+
     def assign(self, node: ast.stmt, name: str, value: ast.expr, depth: int) -> str:
         pad = "  " * depth
+        if name == self.state:
+            raise self.fail(node, f"reassignment of {name}")
         py_type = self.expr.type_of(value)
         if name in self.locals and self.t.base(self.locals[name]) != self.t.base(py_type):
             raise self.fail(node, f"{name} changes type")
@@ -860,10 +1025,17 @@ class FunctionTranslator:
                 return f"{pad}let {ident(name)} := {rendered}\n"
             raise self.fail(node, f"reassignment of {name}")
         if depth > 1:
-            raise self.fail(node, f"{name} first assigned inside a block")
+            # A name that lives and dies inside this block is a local of it.
+            body = self.node.body
+            if self.names(self.blocks[-1], name) != self.names(body, name):
+                raise self.fail(node, f"{name} first assigned inside a block")
+            self.block_locals[-1].add(name)
+            again = sum(name in self.assigned(n) for n in ast.walk(self.node)) > 1
+        else:
+            again = name in self.mutable
         self.locals[name] = py_type
         self.declared.add(name)
-        keyword = "let mut" if name in self.mutable else "let"
+        keyword = "let mut" if again else "let"
         return f"{pad}{keyword} {ident(name)} := {rendered}\n"
 
     def exception_name(self, node: ast.Raise) -> str:
