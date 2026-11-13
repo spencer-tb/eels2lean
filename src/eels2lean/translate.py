@@ -27,6 +27,10 @@ FIXED_BITS = {"U64": 64, "U256": 256}
 BUILTIN_TYPES = {"int": "Int", "bool": "Bool"}
 LEAN_TYPES = {"Uint": "Uint", "U64": "U64", "U256": "U256", **BUILTIN_TYPES}
 
+# Exception classes with a constructor in the runtime's `Exc`. Keep the two
+# in step: the Lean build fails on a name the runtime does not have.
+EXCEPTIONS = ("AssertionError", "OverflowError", "ZeroDivisionError")
+
 LEAN_KEYWORDS = {
     "at", "by", "calc", "class", "def", "do", "else", "end", "example",
     "export", "fun", "have", "if", "import", "in", "instance", "let",
@@ -835,10 +839,10 @@ class FunctionTranslator:
                 out += f"{pad}else\n{self.block(node.orelse, depth + 1)}"
             return out
         if isinstance(node, ast.Raise):
-            return f"{pad}throw ⟨\"{self.exception_name(node)}\"⟩\n"
+            return f"{pad}throw Exc.{self.exception_name(node)}\n"
         if isinstance(node, ast.Assert):
             test = self.expr.expr(node.test)
-            return f"{pad}if !{test} then\n{pad}  throw ⟨\"AssertionError\"⟩\n"
+            return f"{pad}if !{test} then\n{pad}  throw Exc.AssertionError\n"
         raise self.fail(node, f"statement {type(node).__name__}")
 
     def assign(self, node: ast.stmt, name: str, value: ast.expr, depth: int) -> str:
@@ -866,9 +870,11 @@ class FunctionTranslator:
         exc = node.exc
         if isinstance(exc, ast.Call):
             exc = exc.func
-        if isinstance(exc, ast.Name):
-            return exc.id
-        raise self.fail(node, "raise")
+        if not isinstance(exc, ast.Name):
+            raise self.fail(node, "raise")
+        if exc.id not in EXCEPTIONS:
+            raise self.fail(node, f"exception class {exc.id} is not in {RUNTIME}.Exc")
+        return exc.id
 
 
 def order(items: dict[str, Item]) -> list[Item]:
