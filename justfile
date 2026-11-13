@@ -5,7 +5,8 @@ cases := "tests/cases"
 gas := "ethereum.forks.amsterdam.vm.gas."
 pure := gas + "max_message_call_gas " + gas + "calculate_memory_gas_cost " + gas + "init_code_cost ethereum.utils.numeric.ceil32 " + gas + "calculate_message_call_gas " + gas + "allocate_evm_gas"
 meter := gas + "charge_gas_from_meter " + gas + "charge_state_gas_from_meter " + gas + "commit_state_gas " + gas + "restore_state_gas " + gas + "restore_state_gas_to_entry " + gas + "tx_state_gas_used " + gas + "credit_state_gas_refund " + gas + "repay_state_gas_spill " + gas + "forfeit_remaining_gas " + gas + "withhold_create_gas " + gas + "drain_state_gas_reservoir " + gas + "restore_child_gas"
-functions := pure + " " + meter + " stateful.spend"
+loops := "ethereum.utils.numeric.taylor_exponential " + gas + "calculate_blob_gas_price"
+functions := pure + " " + meter + " " + loops + " stateful.spend"
 
 # Copy the pinned EELS commit into .cache/eels/<commit>.
 snapshot:

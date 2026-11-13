@@ -14,6 +14,10 @@ agree on every input.
 
 An input is one integer per number, in parameter order. A dataclass
 parameter takes one integer per field.
+
+The Lean of a `while` has a step limit, which Python does not. An input on
+which the Lean runs out of steps is left out: the Python loop may run for
+a very long time on it.
 """
 
 import argparse
@@ -122,22 +126,31 @@ def main() -> int:
             f["kind"] for p in entry["params"] for f in p.get("fields", [p])
         ]
         cases = inputs(kinds, rng, args.random)
-        expected = [run_python(entry, c) for c in cases]
         stdin = "".join(
             f"{function} {' '.join(map(str, c))}\n" for c in cases
         )
         got = subprocess.run(
             [str(exe)], input=stdin, capture_output=True, text=True, check=True
         ).stdout.splitlines()
+        count = len(cases)
+        if len(got) == count and entry["fuel"]:
+            kept = [i for i, g in enumerate(got) if g != "err OutOfFuel"]
+            cases = [cases[i] for i in kept]
+            got = [got[i] for i in kept]
+        expected = [run_python(entry, c) for c in cases]
         bad = [
             (c, e, g) for c, e, g in zip(cases, expected, got) if e != g
         ]
         if len(got) != len(cases):
             bad.append(((), f"{len(cases)} results", f"{len(got)} results"))
+        if not cases:
+            bad.append(((), "an input within the step limit", "none"))
         errors = sum(e.startswith("err") for e in expected)
         status = "ok  " if not bad else "FAIL"
+        skipped = count - len(cases)
         print(f"{status} {function}: {len(cases)} inputs, {errors} raise, "
-              f"{len(bad)} differ")
+              f"{len(bad)} differ"
+              + (f", {skipped} more over the step limit" if skipped else ""))
         for case, e, g in bad[:5]:
             print(f"     {case}: python {e}, lean {g}")
         failures += len(bad)

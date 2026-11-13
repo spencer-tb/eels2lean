@@ -10,6 +10,10 @@ A function that only computes returns `Except Exc α`. A function that
 assigns to a field of a dataclass parameter returns `EStateM Exc σ α`, with
 that parameter as the state `σ`, so a write made before a raise is kept.
 
+A `while` becomes a function of its own that counts its steps down from
+`fuel`, since Lean needs every function to end. A function with a `while`,
+or one that calls such a function, takes `fuel` as its first argument.
+
 Anything outside the supported subset raises `Unsupported`, naming the file
 and line. The translator never guesses.
 """
@@ -39,6 +43,9 @@ LEAN_TYPES = {
 EXCEPTIONS = (
     "AssertionError", "OverflowError", "ZeroDivisionError", "OutOfGasError",
 )
+
+# The step limit of a `while`, and of every function that reaches one.
+FUEL = "fuel"
 
 LEAN_KEYWORDS = {
     "at", "by", "calc", "class", "def", "do", "else", "end", "example",
@@ -98,11 +105,13 @@ class Signature:
     Parameter and return types of a translated function.
 
     `state` names the dataclass parameter the function changes, if any.
+    `fuel` says the function takes a step limit before its parameters.
     """
 
     params: list[tuple[str, str]]
     returns: str
     state: str | None = None
+    fuel: bool = False
 
 
 class Project:
@@ -429,6 +438,9 @@ class ExprTranslator:
         self.locals = locals_
         self.scope = scope
         self.state: str | None = None
+        # The step limit in scope, and whether a call passed it on.
+        self.fuel: str | None = None
+        self.fuelled = False
         self.deps: set[str] = set()
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
@@ -709,9 +721,14 @@ class ExprTranslator:
         if fq in self.t.signatures:
             if self.t.signatures[fq].state is not None:
                 raise self.fail(node, "call to a function that changes its argument")
-            ref = self.lean_ref(fq)
-            rendered = " ".join(self.expr(a) for a in args)
-            return f"(← {ref} {rendered})"
+            rendered = [self.lean_ref(fq)]
+            if self.t.signatures[fq].fuel:
+                if self.fuel is None:
+                    raise self.fail(node, "call to a function with a while")
+                self.fuelled = True
+                rendered.append(self.fuel)
+            rendered += [self.expr(a) for a in args]
+            return f"(← {' '.join(rendered)})"
         raise self.fail(node, "call target")
 
     def construct(self, node: ast.Call, kind: str, arg: ast.expr) -> str:
@@ -758,6 +775,8 @@ class FunctionTranslator:
         # Open blocks, innermost last, and the names local to each.
         self.blocks: list[list[ast.stmt]] = []
         self.block_locals: list[set[str]] = []
+        # The functions its `while` loops became.
+        self.loops: list[str] = []
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
         return Unsupported(f"{self.module.where(node)}: {what}")
@@ -791,6 +810,9 @@ class FunctionTranslator:
             returns = self.t.py_type(self.module, node.returns)
         self.state = self.expr.state = self.find_state(params)
         self.t.signatures[fq] = Signature(params, returns, self.state)
+        names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        if FUEL not in names | {name for name, _ in params}:
+            self.expr.fuel = FUEL
         self.mutable = self.find_mutable(node.body)
         prologue = "".join(
             f"  let mut {ident(n)} := {ident(n)}\n"
@@ -804,18 +826,16 @@ class FunctionTranslator:
             for name, t in params
             if name != self.state
         )
-        if self.state is None:
-            monad = "Except Exc"
-            doc = f"/-- `{node.name}` from `{self.module.name}` -/\n"
-        else:
-            monad = f"EStateM Exc {self.t.lean_type(self.locals[self.state])}"
-            doc = (
-                f"/-- `{node.name}` from `{self.module.name}`. "
-                f"The state is `{self.state}`. -/\n"
-            )
-        lean = (
-            f"{doc}def {ident(node.name)}{rendered} : "
-            f"{monad} {self.t.lean_type(returns)} := do\n{body}"
+        doc = f"`{node.name}` from `{self.module.name}`"
+        if self.state is not None:
+            doc += f". The state is `{self.state}`."
+        if self.expr.fuelled:
+            self.t.signatures[fq].fuel = True
+            rendered = f" ({FUEL} : Nat){rendered}"
+            doc += f". `{FUEL}` bounds the steps of its loops."
+        lean = "".join(self.loops) + (
+            f"/-- {doc} -/\ndef {ident(node.name)}{rendered} : "
+            f"{self.monad()} {self.t.lean_type(returns)} := do\n{body}"
         )
         deps = set(self.expr.deps)
         for _, py_type in params:
@@ -833,6 +853,12 @@ class FunctionTranslator:
         ):
             return body[1:]
         return body
+
+    def monad(self) -> str:
+        """Return the Lean monad the function runs in."""
+        if self.state is None:
+            return "Except Exc"
+        return f"EStateM Exc {self.t.lean_type(self.locals[self.state])}"
 
     def find_state(self, params: list[tuple[str, str]]) -> str | None:
         """Return the dataclass parameter whose fields the function assigns."""
@@ -967,12 +993,70 @@ class FunctionTranslator:
                 out += f"{pad}else\n{self.block(node.orelse, depth + 1)}"
                 self.writes = max(after, self.writes)
             return out
+        if isinstance(node, ast.While):
+            return self.loop(node, depth)
         if isinstance(node, ast.Raise):
             return f"{pad}throw Exc.{self.exception_name(node)}\n"
         if isinstance(node, ast.Assert):
             test = self.expr.expr(node.test)
             return f"{pad}if !{test} then\n{pad}  throw Exc.AssertionError\n"
         raise self.fail(node, f"statement {type(node).__name__}")
+
+    def loop(self, node: ast.While, depth: int) -> str:
+        """
+        Translate a `while` into a function of its own, and a call to it.
+
+        The function takes the step limit, then the variables the loop
+        assigns, and returns those variables as the loop leaves them. Each
+        test of the condition takes one step, and it raises `OutOfFuel`
+        when none is left.
+        """
+        if self.state is not None:
+            raise self.fail(node, "while in a function that changes a dataclass")
+        if self.expr.fuel is None:
+            raise self.fail(node, f"while in a function that uses the name {FUEL}")
+        if node.orelse:
+            raise self.fail(node, "else of a while")
+        for inner in ast.walk(node):
+            if inner is not node and isinstance(
+                inner, (ast.While, ast.For, ast.Break, ast.Continue, ast.Return)
+            ):
+                raise self.fail(inner, f"{type(inner).__name__} inside a while")
+        test = self.expr.expr(node.test)
+        if "←" in test:
+            raise self.fail(node.test, "raising test of a while")
+        assigned = {name for n in ast.walk(node) for name in self.assigned(n)}
+        used = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        carried = [n for n in self.locals if n in assigned]
+        fixed = [n for n in self.locals if n in used and n not in assigned]
+
+        name = f"{self.node.name}.loop{len(self.loops) + 1 if self.loops else ''}"
+        ref = ".".join(ident(p) for p in f"{self.module.name}.{name}".split("."))
+        types = [self.t.lean_type(self.locals[n]) for n in carried]
+        values = ", ".join(ident(n) for n in carried)
+        again = " ".join([ref, *(ident(n) for n in fixed), FUEL, *map(ident, carried)])
+        params = "".join(
+            f" ({ident(n)} : {self.t.lean_type(self.locals[n])})" for n in fixed
+        )
+        result = " × ".join(types) if types else "Unit"
+        if len(types) > 1:
+            result, values = f"({result})", f"({values})"
+        body = self.block(node.body, 3)
+        self.loops.append(
+            f"/-- The `while` of `{self.node.name}`. It may test its condition "
+            f"`{FUEL}` times. -/\n"
+            f"def {name}{params} : "
+            f"{' → '.join(['Nat', *types, f'{self.monad()} {result}'])}\n"
+            f"  | {', '.join(['0', *('_' for _ in carried)])} => "
+            f"throw Exc.OutOfFuel\n"
+            f"  | {', '.join([f'{FUEL} + 1', *map(ident, carried)])} => do\n"
+            + "".join(f"    let mut {ident(n)} := {ident(n)}\n" for n in carried)
+            + f"    if {test} then\n{body}      {again}\n"
+            f"    else\n      return {values or '()'}\n\n"
+        )
+        self.expr.fuelled = True
+        pad = "  " * depth
+        return f"{pad}{values} ← {again}\n" if carried else f"{pad}{again}\n"
 
     def store(
         self, node: ast.stmt, target: ast.Attribute, value: ast.expr, depth: int

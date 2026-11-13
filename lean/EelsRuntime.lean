@@ -26,12 +26,16 @@ A Python exception, identified by its class.
 One constructor per class that translated code can raise so far: the
 builtins this runtime raises itself, then the classes EELS defines. The
 translator refuses a `raise` of any other class.
+
+`OutOfFuel` is not a Python exception. A `while` is translated with a limit
+on its steps, and this is what it raises when the limit is too small.
 -/
 inductive Exc where
   | AssertionError
   | OverflowError
   | ZeroDivisionError
   | OutOfGasError
+  | OutOfFuel
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- The Python name of the exception's class. -/
@@ -40,6 +44,7 @@ def Exc.name : Exc → String
   | .OverflowError => "OverflowError"
   | .ZeroDivisionError => "ZeroDivisionError"
   | .OutOfGasError => "OutOfGasError"
+  | .OutOfFuel => "OutOfFuel"
 
 /-- Raise the Python exception `e`. -/
 def raise {α : Type} (e : Exc) : Except Exc α :=

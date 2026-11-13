@@ -47,6 +47,8 @@ def write_modules(out: Path, sources: dict[str, str], root: str) -> None:
 CHECK_BITS = {"U64": 64, "U256": 256}
 CHECK_FIELDS = ("Uint", "int")
 CHECK_PARAMS = (*CHECK_FIELDS, *CHECK_BITS)
+# The step limit the check gives a function with a `while`.
+CHECK_FUEL = 256
 
 CHECK_PRELUDE = """\
 /-- What one call gave: numbers or an exception, and the changed dataclass. -/
@@ -158,6 +160,8 @@ def check_arm(t: Translator, fq: str) -> tuple[str, dict] | None:
             params.append({"name": name, "kind": kind})
         else:
             return None
+    if sig.fuel:
+        args.insert(0, str(CHECK_FUEL))
     call = " ".join([".".join(ident(p) for p in fq.split(".")), *args])
     lines.append(f"let r ← {call}" if values else call)
     lines.append(f"return [{', '.join(values)}]")
@@ -175,6 +179,7 @@ def check_arm(t: Translator, fq: str) -> tuple[str, dict] | None:
         "params": params,
         "fields": names,
         "state": sig.state,
+        "fuel": CHECK_FUEL if sig.fuel else None,
     }
     return arm, entry
 
@@ -191,6 +196,7 @@ def write_check(out: Path, t: Translator, functions: list[str]) -> None:
     and one per field of a dataclass. It prints the result's numbers.
     For a function that changes a dataclass it then prints the fields of
     that dataclass as the call left them, whether it returned or raised.
+    A function with a `while` gets `CHECK_FUEL` as its step limit.
     """
     arms = []
     manifest = []
