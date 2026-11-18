@@ -6,11 +6,24 @@ functions and follows every name they use to its definition, across
 modules. Each EELS module becomes one Lean module, and each definition
 keeps its EELS name inside a namespace equal to its EELS module path.
 
+A function that only computes returns `Except Exc α`. A function that
+assigns to a field of a dataclass parameter returns `EStateM Exc σ α`, with
+that parameter as the state `σ`, so a write made before a raise is kept.
+
+A union of dataclasses named at module level becomes an inductive type with
+one constructor per class, and `isinstance` on it becomes a `match`. Any
+other union becomes `Option` when one side is `None`, and `⊕` otherwise.
+
+A `while` becomes a function of its own that counts its steps down from
+`fuel`, since Lean needs every function to end. A function with a `while`,
+or one that calls such a function, takes `fuel` as its first argument.
+
 Anything outside the supported subset raises `Unsupported`, naming the file
 and line. The translator never guesses.
 """
 
 import ast
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,12 +33,30 @@ LEAN_ROOT = "Eels"
 # Types from `ethereum_types.numeric`, mapped to runtime types.
 NUMERIC = {
     "ethereum_types.numeric.Uint": "Uint",
+    "ethereum_types.numeric.U8": "U8",
     "ethereum_types.numeric.U64": "U64",
     "ethereum_types.numeric.U256": "U256",
 }
-FIXED_BITS = {"U64": 64, "U256": 256}
+FIXED_BITS = {"U8": 8, "U64": 64, "U256": 256}
+# Types from `ethereum_types.bytes`: `Bytes`, and `Bytes0` to `Bytes256`.
+BYTES = "ethereum_types.bytes.Bytes"
+FIXED_BYTES = re.compile(r"Bytes(\d+)")
 BUILTIN_TYPES = {"int": "Int", "bool": "Bool"}
-LEAN_TYPES = {"Uint": "Uint", "U64": "U64", "U256": "U256", **BUILTIN_TYPES}
+LEAN_TYPES = {
+    "Uint": "Uint", "U8": "U8", "U64": "U64", "U256": "U256", "None": "Unit",
+    "Bytes": "Bytes",
+    **BUILTIN_TYPES,
+}
+
+# Exception classes with a constructor in the runtime's `Exc`. Keep the two
+# in step: the Lean build fails on a name the runtime does not have.
+EXCEPTIONS = (
+    "AssertionError", "OverflowError", "ZeroDivisionError", "OutOfGasError",
+    "InvalidSignatureError",
+)
+
+# The step limit of a `while`, and of every function that reaches one.
+FUEL = "fuel"
 
 LEAN_KEYWORDS = {
     "at", "by", "calc", "class", "def", "do", "else", "end", "example",
@@ -81,34 +112,42 @@ class Constant:
 
 @dataclass
 class Signature:
-    """Parameter and return types of a translated function."""
+    """
+    Parameter and return types of a translated function.
+
+    `state` names the dataclass parameter the function changes, if any.
+    `fuel` says the function takes a step limit before its parameters.
+    """
 
     params: list[tuple[str, str]]
     returns: str
+    state: str | None = None
+    fuel: bool = False
 
 
 class Project:
-    """All EELS modules under a source root, loaded on demand."""
+    """All modules under the source roots, loaded on demand."""
 
-    def __init__(self, src: Path) -> None:
-        self.src = src
+    def __init__(self, *srcs: Path) -> None:
+        self.srcs = srcs
         self.modules: dict[str, Module] = {}
 
     def module(self, name: str) -> Module | None:
         """Load the module called `name`, or return `None`."""
         if name in self.modules:
             return self.modules[name]
-        base = self.src.joinpath(*name.split("."))
-        for path, is_package in (
-            (base.with_suffix(".py"), False),
-            (base / "__init__.py", True),
-        ):
-            if path.is_file():
-                tree = ast.parse(path.read_text(), filename=str(path))
-                module = Module(name, path, tree, is_package)
-                self._index(module)
-                self.modules[name] = module
-                return module
+        for src in self.srcs:
+            base = src.joinpath(*name.split("."))
+            for path, is_package in (
+                (base.with_suffix(".py"), False),
+                (base / "__init__.py", True),
+            ):
+                if path.is_file():
+                    tree = ast.parse(path.read_text(), filename=str(path))
+                    module = Module(name, path, tree, is_package)
+                    self._index(module)
+                    self.modules[name] = module
+                    return module
         return None
 
     def _index(self, module: Module) -> None:
@@ -188,6 +227,13 @@ class Translator:
         self.signatures: dict[str, Signature] = {}
         self.aliases: dict[str, str] = {}
         self.records: dict[str, list[tuple[str, str]]] = {}
+        # Named unions of dataclasses, by the classes they hold.
+        self.unions: dict[str, list[str]] = {}
+        # Types written in place, such as `U64 | None`: their Lean and the
+        # declarations they need.
+        self.compound: dict[str, tuple[str, set[str]]] = {}
+        # The type `X` inside each `X | None`.
+        self.optionals: dict[str, str] = {}
         self.in_progress: set[str] = set()
 
     # Names and types.
@@ -210,20 +256,80 @@ class Translator:
             and node.value.id == "Final"
         ):
             return self.py_type(module, node.slice)
+        if isinstance(node, ast.Constant) and node.value is None:
+            return "None"
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return self.union_type(module, node)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            fq = self.global_fq(module, node.value.id)
+            elements = node.slice
+            if (
+                (node.value.id == "tuple" or fq == "typing.Tuple")
+                and isinstance(elements, ast.Tuple)
+                and len(elements.elts) == 2
+                and isinstance(elements.elts[1], ast.Constant)
+                and elements.elts[1].value is Ellipsis
+            ):
+                inner = self.py_type(module, elements.elts[0])
+                key = f"Tuple[{inner}, ...]"
+                self.compound[key] = (
+                    f"(List {self.lean_type(inner)})", self.type_deps(inner)
+                )
+                return key
         if isinstance(node, ast.Name):
             if node.id in BUILTIN_TYPES:
                 return node.id
             fq = self.global_fq(module, node.id)
             if fq in NUMERIC:
                 return NUMERIC[fq]
+            if fq is not None and fq.startswith(BYTES):
+                size = fq[len(BYTES):]
+                if size == "" or size.isdigit():
+                    return fq.rpartition(".")[2]
             if fq is not None:
                 self.require(fq)
                 fq = self.canonical(fq)
-                if fq in self.aliases or fq in self.records:
+                if fq in self.aliases or fq in self.records or fq in self.unions:
                     return fq
         raise Unsupported(
             f"{module.where(node)}: type annotation {ast.unparse(node)}"
         )
+
+    def union_type(self, module: Module, node: ast.BinOp) -> str:
+        """Translate `A | B | ...` written in place."""
+        sides: list[ast.expr] = [node]
+        while any(isinstance(n, ast.BinOp) for n in sides):
+            sides = [
+                part
+                for n in sides
+                for part in (
+                    (n.left, n.right)
+                    if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr)
+                    else (n,)
+                )
+            ]
+            if any(isinstance(n, ast.BinOp) and not isinstance(n.op, ast.BitOr)
+                   for n in sides):
+                raise Unsupported(f"{module.where(node)}: union {ast.unparse(node)}")
+        members = [self.py_type(module, side) for side in sides]
+        others = [m for m in members if m != "None"]
+        if len(others) == 1 and len(members) == 2:
+            key = f"{others[0]} | None"
+            self.optionals[key] = others[0]
+            self.compound[key] = (
+                f"(Option {self.lean_type(others[0])})",
+                self.type_deps(others[0]),
+            )
+            return key
+        if len(others) != len(members) or len(set(members)) != len(members):
+            raise Unsupported(f"{module.where(node)}: union {ast.unparse(node)}")
+        key = " | ".join(members)
+        deps: set[str] = set()
+        for m in members:
+            deps |= self.type_deps(m)
+        lean = " ⊕ ".join(self.lean_type(m) for m in members)
+        self.compound[key] = (f"({lean})", deps)
+        return key
 
     def base(self, py_type: str) -> str:
         """Follow `NewType` aliases down to a runtime type."""
@@ -235,6 +341,11 @@ class Translator:
         """Return the Lean name of a Python type key."""
         if py_type in LEAN_TYPES:
             return LEAN_TYPES[py_type]
+        if py_type in self.compound:
+            return self.compound[py_type][0]
+        size = FIXED_BYTES.fullmatch(py_type)
+        if size:
+            return f"(FixedBytes {size.group(1)})"
         return py_type
 
     def canonical(self, fq: str) -> str:
@@ -289,16 +400,61 @@ class Translator:
             self.aliases[fq] = base
             lean = f"/-- `{name} = NewType(\"{name}\", ...)` -/\nabbrev {ident(name)} := {self.lean_type(base)}\n"
             return Item(fq, module.name, lean, self.type_deps(base))
+        if isinstance(call, (ast.Name, ast.Attribute)):
+            return self.type_alias(module, node, name)
+        if isinstance(call, ast.BinOp) and isinstance(call.op, ast.BitOr):
+            return self.named_union(module, node, name)
         raise Unsupported(f"{module.where(node)}: module-level {name}")
+
+    def type_alias(self, module: Module, node: ast.Assign, name: str) -> Item:
+        """Translate `X = Y` for a type `Y`. Python reads `X` as `Y`."""
+        try:
+            base = self.py_type(module, node.value)
+        except Unsupported:
+            raise Unsupported(f"{module.where(node)}: module-level {name}") from None
+        fq = f"{module.name}.{name}"
+        self.aliases[fq] = base
+        target = ast.unparse(node.value)
+        lean = f"/-- `{name} = {target}` -/\nabbrev {ident(name)} := {self.lean_type(base)}\n"
+        return Item(fq, module.name, lean, self.type_deps(base))
+
+    def named_union(self, module: Module, node: ast.Assign, name: str) -> Item:
+        """
+        Translate `X = A | B | ...` of dataclasses into an inductive type.
+
+        Each constructor has the name of its class and holds one value of
+        it, so `isinstance` becomes a `match` on the constructor.
+        """
+        members = self.union_type(module, node.value).split(" | ")
+        if not all(m in self.records for m in members):
+            raise Unsupported(
+                f"{module.where(node)}: union {name} of other than dataclasses"
+            )
+        fq = f"{module.name}.{name}"
+        self.unions[fq] = members
+        short = [m.rpartition(".")[2] for m in members]
+        arms = "".join(
+            f"  | {ident(s)} (value : {self.lean_type(m)})\n"
+            for s, m in zip(short, members)
+        )
+        lean = (
+            f"/-- `{name} = {' | '.join(short)}` -/\n"
+            f"inductive {ident(name)} where\n{arms}"
+        )
+        return Item(fq, module.name, lean, set(members))
 
     def type_deps(self, py_type: str) -> set[str]:
         """Return the declarations a type key depends on."""
         if py_type in self.aliases or py_type in self.records:
             return {py_type}
+        if py_type in self.unions:
+            return {py_type}
+        if py_type in self.compound:
+            return set(self.compound[py_type][1])
         return set()
 
     def record(self, module: Module, cls: ast.ClassDef) -> Item:
-        """Translate a `@dataclass` with only annotated fields."""
+        """Translate a `@dataclass` of annotated fields, with their defaults."""
         decorators = [
             self.global_fq(module, d.id)
             for d in cls.decorator_list
@@ -306,27 +462,48 @@ class Translator:
         ]
         if len(decorators) != len(cls.decorator_list) or (
             "dataclasses.dataclass" not in decorators
-        ) or not set(decorators) <= {"dataclasses.dataclass", "typing.final"}:
+        ) or not set(decorators) <= {
+            "dataclasses.dataclass",
+            "typing.final",
+            "ethereum_types.frozen.slotted_freezable",
+        }:
             raise Unsupported(f"{module.where(cls)}: class {cls.name}")
         if cls.bases or cls.keywords:
             raise Unsupported(f"{module.where(cls)}: base classes of {cls.name}")
         fields: list[tuple[str, str]] = []
-        for stmt in FunctionTranslator.strip_docstring(cls.body):
+        rendered = ""
+        expr = ExprTranslator(self, module, {})
+        for stmt in cls.body:
             if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                # The docstring of the class or of the field above.
+                continue
+            if not (
                 isinstance(stmt, ast.AnnAssign)
                 and isinstance(stmt.target, ast.Name)
-                and stmt.value is None
             ):
-                fields.append((stmt.target.id, self.py_type(module, stmt.annotation)))
-            else:
                 raise Unsupported(f"{module.where(stmt)}: body of {cls.name}")
+            name = stmt.target.id
+            py_type = self.py_type(module, stmt.annotation)
+            default = ""
+            if stmt.value is not None:
+                if self.base(expr.type_of(stmt.value)) != self.base(py_type):
+                    raise Unsupported(f"{module.where(stmt)}: default of {name}")
+                value = expr.expr(stmt.value)
+                if "←" in value:
+                    raise Unsupported(
+                        f"{module.where(stmt)}: raising default of {name}"
+                    )
+                default = f" := {value}"
+            fields.append((name, py_type))
+            rendered += f"  {ident(name)} : {self.lean_type(py_type)}{default}\n"
         fq = f"{module.name}.{cls.name}"
         self.records[fq] = fields
-        rendered = "".join(
-            f"  {ident(n)} : {self.lean_type(t)}\n" for n, t in fields
-        )
         lean = f"/-- `@dataclass {cls.name}` -/\nstructure {ident(cls.name)} where\n{rendered}"
-        deps: set[str] = set()
+        deps = set(expr.deps)
         for _, t in fields:
             deps |= self.type_deps(t)
         return Item(fq, module.name, lean, deps)
@@ -392,6 +569,10 @@ class ExprTranslator:
         self.module = module
         self.locals = locals_
         self.scope = scope
+        self.state: str | None = None
+        # The step limit in scope, and whether a call passed it on.
+        self.fuel: str | None = None
+        self.fuelled = False
         self.deps: set[str] = set()
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
@@ -415,6 +596,9 @@ class ExprTranslator:
             if fq in self.t.constants:
                 return self.t.constants[fq].py_type
         if isinstance(node, ast.Attribute):
+            kind = self.max_value(node)
+            if kind is not None:
+                return kind
             field = self.record_field(node)
             if field is not None:
                 return field
@@ -469,6 +653,18 @@ class ExprTranslator:
             raise self.fail(node, "attribute of a local")
         return None
 
+    def max_value(self, node: ast.Attribute) -> str | None:
+        """Return `U64` for `U64.MAX_VALUE`, and likewise for each width."""
+        if (
+            node.attr == "MAX_VALUE"
+            and isinstance(node.value, ast.Name)
+            and node.value.id not in self.locals
+        ):
+            kind = NUMERIC.get(self.t.global_fq(self.module, node.value.id) or "")
+            if kind in FIXED_BITS:
+                return kind
+        return None
+
     # Name resolution.
 
     def canonical(self, fq: str) -> str:
@@ -510,6 +706,10 @@ class ExprTranslator:
                 return str(node.value)
             raise self.fail(node, "constant")
         if isinstance(node, ast.Name):
+            if node.id == self.state:
+                # Only its fields are read: a second name for the dataclass
+                # would not see later writes.
+                raise self.fail(node, "the changed dataclass used as a value")
             if node.id in self.locals:
                 return ident(node.id)
             fq = self.ref_fq(node)
@@ -517,6 +717,10 @@ class ExprTranslator:
                 return self.constant_ref(node, fq)
             raise self.fail(node, "unknown name")
         if isinstance(node, ast.Attribute):
+            kind = self.max_value(node)
+            if kind is not None:
+                bits = FIXED_BITS[kind]
+                return f"(⟨2 ^ {bits} - 1, by decide⟩ : {RUNTIME}.Fixed {bits})"
             if self.record_field(node) is not None:
                 return f"{ident(node.value.id)}.{ident(node.attr)}"
             fq = self.attr_fq(node)
@@ -570,6 +774,7 @@ class ExprTranslator:
             names = {
                 ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul",
                 ast.FloorDiv: "floorDiv", ast.Mod: "mod", ast.Pow: "pow",
+                ast.RShift: "shr",
             }
             if op in names:
                 return f"(← {RUNTIME}.Fixed.{names[op]} {left} {right})"
@@ -666,9 +871,16 @@ class ExprTranslator:
             rendered = " ".join(self.expr(a) for a in args)
             return f"({ref}.mk {rendered})"
         if fq in self.t.signatures:
-            ref = self.lean_ref(fq)
-            rendered = " ".join(self.expr(a) for a in args)
-            return f"(← {ref} {rendered})"
+            if self.t.signatures[fq].state is not None:
+                raise self.fail(node, "call to a function that changes its argument")
+            rendered = [self.lean_ref(fq)]
+            if self.t.signatures[fq].fuel:
+                if self.fuel is None:
+                    raise self.fail(node, "call to a function with a while")
+                self.fuelled = True
+                rendered.append(self.fuel)
+            rendered += [self.expr(a) for a in args]
+            return f"(← {' '.join(rendered)})"
         raise self.fail(node, "call target")
 
     def construct(self, node: ast.Call, kind: str, arg: ast.expr) -> str:
@@ -706,6 +918,19 @@ class FunctionTranslator:
         self.params: set[str] = set()
         self.shadowed: set[str] = set()
         self.expr = ExprTranslator(t, module, self.locals)
+        # The dataclass parameter the function changes, if any.
+        self.state: str | None = None
+        # Writes to the state on the path so far, and per open block the
+        # count at which the block last read the state into a local.
+        self.writes = 0
+        self.snapshots: list[int | None] = []
+        # Open blocks, innermost last, and the names local to each.
+        self.blocks: list[list[ast.stmt]] = []
+        self.block_locals: list[set[str]] = []
+        # The functions its `while` loops became.
+        self.loops: list[str] = []
+        # The type the function returns.
+        self.returns = "None"
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
         return Unsupported(f"{self.module.where(node)}: {what}")
@@ -733,8 +958,16 @@ class FunctionTranslator:
             if "←" in rendered_default:
                 raise self.fail(value, f"raising default of {name}")
             defaults[name] = rendered_default
-        returns = self.t.py_type(self.module, node.returns)
-        self.t.signatures[fq] = Signature(params, returns)
+        if isinstance(node.returns, ast.Constant) and node.returns.value is None:
+            returns = "None"
+        else:
+            returns = self.t.py_type(self.module, node.returns)
+        self.returns = returns
+        self.state = self.expr.state = self.find_state(params)
+        self.t.signatures[fq] = Signature(params, returns, self.state)
+        names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        if FUEL not in names | {name for name, _ in params}:
+            self.expr.fuel = FUEL
         self.mutable = self.find_mutable(node.body)
         prologue = "".join(
             f"  let mut {ident(n)} := {ident(n)}\n"
@@ -742,15 +975,22 @@ class FunctionTranslator:
             if n in self.mutable
         )
         body = prologue + self.block(self.strip_docstring(node.body), 1)
-        rendered = " ".join(
-            f"({ident(name)} : {self.t.lean_type(t)}"
+        rendered = "".join(
+            f" ({ident(name)} : {self.t.lean_type(t)}"
             + (f" := {defaults[name]})" if name in defaults else ")")
             for name, t in params
+            if name != self.state
         )
-        doc = f"/-- `{node.name}` from `{self.module.name}` -/\n"
-        lean = (
-            f"{doc}def {ident(node.name)} {rendered} : "
-            f"Except Exc {self.t.lean_type(returns)} := do\n{body}"
+        doc = f"`{node.name}` from `{self.module.name}`"
+        if self.state is not None:
+            doc += f". The state is `{self.state}`."
+        if self.expr.fuelled:
+            self.t.signatures[fq].fuel = True
+            rendered = f" ({FUEL} : Nat){rendered}"
+            doc += f". `{FUEL}` bounds the steps of its loops."
+        lean = "".join(self.loops) + (
+            f"/-- {doc} -/\ndef {ident(node.name)}{rendered} : "
+            f"{self.monad()} {self.t.lean_type(returns)} := do\n{body}"
         )
         deps = set(self.expr.deps)
         for _, py_type in params:
@@ -768,6 +1008,36 @@ class FunctionTranslator:
         ):
             return body[1:]
         return body
+
+    def monad(self) -> str:
+        """Return the Lean monad the function runs in."""
+        if self.state is None:
+            return "Except Exc"
+        return f"EStateM Exc {self.t.lean_type(self.locals[self.state])}"
+
+    def find_state(self, params: list[tuple[str, str]]) -> str | None:
+        """Return the dataclass parameter whose fields the function assigns."""
+        records = {name for name, t in params if t in self.t.records}
+        changed = sorted({
+            n.value.id
+            for n in ast.walk(self.node)
+            if isinstance(n, ast.Attribute)
+            and isinstance(n.ctx, ast.Store)
+            and isinstance(n.value, ast.Name)
+            and n.value.id in records
+        })
+        if len(changed) > 1:
+            raise self.fail(
+                self.node, f"changes more than one dataclass: {', '.join(changed)}"
+            )
+        return changed[0] if changed else None
+
+    def reads_state(self, node: ast.stmt) -> bool:
+        """Return whether `node` itself, not a block inside it, names the state."""
+        root = node.test if isinstance(node, ast.If) else node
+        return any(
+            isinstance(n, ast.Name) and n.id == self.state for n in ast.walk(root)
+        )
 
     def find_mutable(self, body: list[ast.stmt]) -> set[str]:
         """Return names assigned more than once or inside nested blocks."""
@@ -800,49 +1070,278 @@ class FunctionTranslator:
     def block(self, stmts: list[ast.stmt], depth: int) -> str:
         if not stmts:
             return "  " * depth + "pure ()\n"
-        return "".join(self.stmt(s, depth) for s in stmts)
+        self.blocks.append(stmts)
+        self.block_locals.append(set())
+        self.snapshots.append(None)
+        try:
+            return "".join(self.stmt(s, depth) for s in stmts)
+        finally:
+            self.snapshots.pop()
+            self.blocks.pop()
+            for name in self.block_locals.pop():
+                del self.locals[name]
+                self.declared.discard(name)
+
+    def read(self, depth: int) -> str:
+        """
+        Return the line that reads the state into a local of its own name.
+
+        Field reads then look as they do in Python. The line is empty when
+        a read still in scope is current: nothing was written since.
+        """
+        if self.writes in self.snapshots:
+            return ""
+        self.snapshots[-1] = self.writes
+        return f"{'  ' * depth}let {ident(self.state)} ← get\n"
 
     def stmt(self, node: ast.stmt, depth: int) -> str:
+        """Translate one statement, reading the state first if it names it."""
+        target = getattr(node, "target", None) or getattr(node, "targets", [None])[0]
+        if (
+            self.state is None
+            or isinstance(target, ast.Attribute)
+            or not self.reads_state(node)
+        ):
+            return self.statement(node, depth)
+        return self.read(depth) + self.statement(node, depth)
+
+    def statement(self, node: ast.stmt, depth: int) -> str:
         pad = "  " * depth
         if isinstance(node, ast.Pass):
             return ""
         if isinstance(node, ast.Return):
-            if node.value is None:
-                return f"{pad}return ()\n"
-            return f"{pad}return {self.expr.expr(node.value)}\n"
+            return f"{pad}return {self.returned(node)}\n"
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            if len(targets) != 1:
                 raise self.fail(node, "assignment target")
             if node.value is None:
                 raise self.fail(node, "annotation without a value")
+            if isinstance(targets[0], ast.Attribute):
+                return self.store(node, targets[0], node.value, depth)
+            if not isinstance(targets[0], ast.Name):
+                raise self.fail(node, "assignment target")
             return self.assign(node, targets[0].id, node.value, depth)
         if isinstance(node, ast.AugAssign):
-            if not isinstance(node.target, ast.Name):
+            target = node.target
+            if isinstance(target, ast.Attribute):
+                left: ast.expr = ast.Attribute(target.value, target.attr, ast.Load())
+            elif isinstance(target, ast.Name):
+                left = ast.Name(target.id, ast.Load())
+            else:
                 raise self.fail(node, "augmented assignment target")
-            value = ast.BinOp(
-                left=ast.Name(node.target.id, ast.Load()),
-                op=node.op,
-                right=node.value,
-            )
+            value = ast.BinOp(left=left, op=node.op, right=node.value)
             ast.copy_location(value, node)
             ast.fix_missing_locations(value)
-            return self.assign(node, node.target.id, value, depth)
+            if isinstance(target, ast.Attribute):
+                return self.store(node, target, value, depth)
+            return self.assign(node, target.id, value, depth)
+        if isinstance(node, ast.If) and self.narrowed(node) is not None:
+            return self.match(node, depth)
         if isinstance(node, ast.If):
             test = self.expr.expr(node.test)
+            before = self.writes
             out = f"{pad}if {test} then\n{self.block(node.body, depth + 1)}"
             if node.orelse:
+                # The other branch starts from the state the test saw.
+                after, self.writes = self.writes, before
                 out += f"{pad}else\n{self.block(node.orelse, depth + 1)}"
+                self.writes = max(after, self.writes)
             return out
+        if isinstance(node, ast.While):
+            return self.loop(node, depth)
         if isinstance(node, ast.Raise):
-            return f"{pad}throw ⟨\"{self.exception_name(node)}\"⟩\n"
+            return f"{pad}throw Exc.{self.exception_name(node)}\n"
         if isinstance(node, ast.Assert):
             test = self.expr.expr(node.test)
-            return f"{pad}if !{test} then\n{pad}  throw ⟨\"AssertionError\"⟩\n"
+            return f"{pad}if !{test} then\n{pad}  throw Exc.AssertionError\n"
         raise self.fail(node, f"statement {type(node).__name__}")
+
+    def returned(self, node: ast.Return) -> str:
+        """Return Lean for the value of a `return`, as `some x` for `X | None`."""
+        value = node.value
+        if value is None or (
+            isinstance(value, ast.Constant) and value.value is None
+        ):
+            if self.returns == "None":
+                return "()"
+            if self.returns in self.t.optionals:
+                return "none"
+            raise self.fail(node, "return of None")
+        rendered = self.expr.expr(value)
+        inner = self.t.optionals.get(self.returns)
+        if inner is not None and (
+            self.t.base(self.expr.type_of(value)) == self.t.base(inner)
+        ):
+            return f"(some {rendered})"
+        return rendered
+
+    def narrowed(self, node: ast.If) -> tuple[str, str] | None:
+        """
+        Return the local and the class of `if isinstance(local, Class):`.
+
+        The local must hold a named union and the class must be one of its
+        members. Return `None` when the test is no `isinstance`.
+        """
+        test = node.test
+        if not (
+            isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Name)
+            and test.func.id == "isinstance"
+        ):
+            return None
+        if test.keywords or len(test.args) != 2:
+            raise self.fail(test, "isinstance")
+        value, cls = test.args
+        if not (
+            isinstance(value, ast.Name)
+            and value.id in self.locals
+            and isinstance(cls, ast.Name)
+        ):
+            raise self.fail(test, "isinstance")
+        union = self.t.base(self.locals[value.id])
+        fq = self.t.global_fq(self.module, cls.id)
+        member = self.t.canonical(fq) if fq is not None else None
+        if union not in self.t.unions or member not in self.t.unions[union]:
+            raise self.fail(test, "isinstance of other than a named union")
+        if value.id == self.state or value.id in self.mutable:
+            raise self.fail(test, f"isinstance of {value.id}, which changes")
+        return value.id, member
+
+    def match(self, node: ast.If, depth: int) -> str:
+        """
+        Translate `if isinstance(x, A):` on a named union into a `match`.
+
+        The `if` branch is the arm of `A`, where `x` is an `A`. As mypy
+        narrows it, the `else` branch sees `x` as each other class of the
+        union in turn, so it becomes one arm per other class. Without an
+        `else`, the other classes do nothing.
+        """
+        found = self.narrowed(node)
+        assert found is not None
+        name, member = found
+        kind = self.locals[name]
+        members = self.t.unions[self.t.base(kind)]
+        if len(members) > 1 and any(
+            isinstance(n, ast.While) for s in node.orelse for n in ast.walk(s)
+        ):
+            raise self.fail(node, "while in the else of an isinstance")
+        pad = "  " * depth
+        var = ident(name)
+        out = f"{pad}match {var} with\n"
+        before = after = self.writes
+        for m in members:
+            body = node.body if m == member else node.orelse
+            if not body:
+                continue
+            self.writes = before
+            self.locals[name] = m
+            try:
+                arm = self.block(body, depth + 2)
+            finally:
+                self.locals[name] = kind
+            after = max(after, self.writes)
+            short = m.rpartition(".")[2]
+            out += f"{pad}  | .{ident(short)} {var} =>\n{arm}"
+        if not node.orelse and len(members) > 1:
+            out += f"{pad}  | _ => pure ()\n"
+        self.writes = after
+        return out
+
+    def loop(self, node: ast.While, depth: int) -> str:
+        """
+        Translate a `while` into a function of its own, and a call to it.
+
+        The function takes the step limit, then the variables the loop
+        assigns, and returns those variables as the loop leaves them. Each
+        test of the condition takes one step, and it raises `OutOfFuel`
+        when none is left.
+        """
+        if self.state is not None:
+            raise self.fail(node, "while in a function that changes a dataclass")
+        if self.expr.fuel is None:
+            raise self.fail(node, f"while in a function that uses the name {FUEL}")
+        if node.orelse:
+            raise self.fail(node, "else of a while")
+        for inner in ast.walk(node):
+            if inner is not node and isinstance(
+                inner, (ast.While, ast.For, ast.Break, ast.Continue, ast.Return)
+            ):
+                raise self.fail(inner, f"{type(inner).__name__} inside a while")
+        test = self.expr.expr(node.test)
+        if "←" in test:
+            raise self.fail(node.test, "raising test of a while")
+        assigned = {name for n in ast.walk(node) for name in self.assigned(n)}
+        used = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        carried = [n for n in self.locals if n in assigned]
+        fixed = [n for n in self.locals if n in used and n not in assigned]
+
+        name = f"{self.node.name}.loop{len(self.loops) + 1 if self.loops else ''}"
+        ref = ".".join(ident(p) for p in f"{self.module.name}.{name}".split("."))
+        types = [self.t.lean_type(self.locals[n]) for n in carried]
+        values = ", ".join(ident(n) for n in carried)
+        again = " ".join([ref, *(ident(n) for n in fixed), FUEL, *map(ident, carried)])
+        params = "".join(
+            f" ({ident(n)} : {self.t.lean_type(self.locals[n])})" for n in fixed
+        )
+        result = " × ".join(types) if types else "Unit"
+        if len(types) > 1:
+            result, values = f"({result})", f"({values})"
+        body = self.block(node.body, 3)
+        self.loops.append(
+            f"/-- The `while` of `{self.node.name}`. It may test its condition "
+            f"`{FUEL}` times. -/\n"
+            f"def {name}{params} : "
+            f"{' → '.join(['Nat', *types, f'{self.monad()} {result}'])}\n"
+            f"  | {', '.join(['0', *('_' for _ in carried)])} => "
+            f"throw Exc.OutOfFuel\n"
+            f"  | {', '.join([f'{FUEL} + 1', *map(ident, carried)])} => do\n"
+            + "".join(f"    let mut {ident(n)} := {ident(n)}\n" for n in carried)
+            + f"    if {test} then\n{body}      {again}\n"
+            f"    else\n      return {values or '()'}\n\n"
+        )
+        self.expr.fuelled = True
+        pad = "  " * depth
+        return f"{pad}{values} ← {again}\n" if carried else f"{pad}{again}\n"
+
+    def store(
+        self, node: ast.stmt, target: ast.Attribute, value: ast.expr, depth: int
+    ) -> str:
+        """
+        Translate `state.field = value`.
+
+        A value that cannot raise is computed from the state as it is at the
+        write. One that can is computed first, from a read of the state, so
+        that a raise leaves the state alone.
+        """
+        if not (isinstance(target.value, ast.Name) and target.value.id == self.state):
+            raise self.fail(node, "assignment target")
+        field = self.expr.record_field(target)
+        if self.t.base(field) != self.t.base(self.expr.type_of(value)):
+            raise self.fail(node, f"{target.attr} changes type")
+        rendered = self.expr.expr(value)
+        pad = "  " * depth
+        state = ident(self.state)
+        update = f"{{ {state} with {ident(target.attr)} := {rendered} }}"
+        if "←" in rendered:
+            out = f"{self.read(depth)}{pad}set {update}\n"
+        else:
+            out = f"{pad}modify fun {state} => {update}\n"
+        self.writes += 1
+        return out
+
+    def names(self, stmts: list[ast.stmt], name: str) -> int:
+        """Count the places in `stmts` that read or assign `name`."""
+        return sum(
+            isinstance(n, ast.Name) and n.id == name
+            for stmt in stmts
+            for n in ast.walk(stmt)
+        )
 
     def assign(self, node: ast.stmt, name: str, value: ast.expr, depth: int) -> str:
         pad = "  " * depth
+        if name == self.state:
+            raise self.fail(node, f"reassignment of {name}")
         py_type = self.expr.type_of(value)
         if name in self.locals and self.t.base(self.locals[name]) != self.t.base(py_type):
             raise self.fail(node, f"{name} changes type")
@@ -856,19 +1355,28 @@ class FunctionTranslator:
                 return f"{pad}let {ident(name)} := {rendered}\n"
             raise self.fail(node, f"reassignment of {name}")
         if depth > 1:
-            raise self.fail(node, f"{name} first assigned inside a block")
+            # A name that lives and dies inside this block is a local of it.
+            body = self.node.body
+            if self.names(self.blocks[-1], name) != self.names(body, name):
+                raise self.fail(node, f"{name} first assigned inside a block")
+            self.block_locals[-1].add(name)
+            again = sum(name in self.assigned(n) for n in ast.walk(self.node)) > 1
+        else:
+            again = name in self.mutable
         self.locals[name] = py_type
         self.declared.add(name)
-        keyword = "let mut" if name in self.mutable else "let"
+        keyword = "let mut" if again else "let"
         return f"{pad}{keyword} {ident(name)} := {rendered}\n"
 
     def exception_name(self, node: ast.Raise) -> str:
         exc = node.exc
         if isinstance(exc, ast.Call):
             exc = exc.func
-        if isinstance(exc, ast.Name):
-            return exc.id
-        raise self.fail(node, "raise")
+        if not isinstance(exc, ast.Name):
+            raise self.fail(node, "raise")
+        if exc.id not in EXCEPTIONS:
+            raise self.fail(node, f"exception class {exc.id} is not in {RUNTIME}.Exc")
+        return exc.id
 
 
 def order(items: dict[str, Item]) -> list[Item]:
