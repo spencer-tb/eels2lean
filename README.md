@@ -51,7 +51,10 @@ every EIP branch.
 | `@dataclass` | `structure` |
 | `Uint` | `Nat` |
 | `U64`, `U256` | fixed width, raise on overflow unless `wrapping_*` |
-| `Bytes` | `ByteArray` |
+| `Bytes`, `Bytes0` to `Bytes256` | `ByteArray`, and one of fixed size |
+| `X = A \| B` of dataclasses, `isinstance` | inductive type, `match` |
+| `X \| None`, other unions in place | `Option`, `⊕` |
+| `Tuple[X, ...]` | `List` |
 | changes to the EVM and state | `EStateM`, with the changed dataclass as its state |
 | `raise`, `try`, `except` | `Except`, or `EStateM` where there is state |
 | `for`, `while` | recursion over lists, or a step limit |
@@ -82,6 +85,15 @@ first argument.
 `Exc` is an inductive type with one constructor per exception class the
 translator can raise.
 
+A union of dataclasses named at module level, such as `Transaction`,
+becomes an inductive type with one constructor per class, and
+`if isinstance(tx, LegacyTransaction):` becomes a `match` on it. As mypy
+narrows `tx`, the `else` branch sees each other class in turn, so it
+becomes one arm per class. `X | None` becomes `Option X`, and any other
+union written in place `⊕`. This is enough for `chain_id` in
+`transactions.py`, translated from EELS as it is: see
+[demo/chainid](demo/chainid/README.md) for proofs about it.
+
 Covered now, and in the differential check:
 
 - The `GasMeter` dataclass and the twelve functions of `vm/gas.py` that
@@ -92,8 +104,12 @@ Covered now, and in the differential check:
   checked EELS function reaches. Today there is one, a write followed by a
   raise.
 
-`tests/expected` holds the Lean generated for the gas meter and the loop,
-so a change to the translator shows up as a change to them in review.
+`chain_id` builds and is in `tests/expected`, but not yet in the
+differential check, which cannot build a `Transaction` input.
+
+`tests/expected` holds the Lean generated for the gas meter, the loop and
+`chain_id`, so a change to the translator shows up as a change to them in
+review.
 `just check` compares them, and `just expected-update` rewrites them.
 
 Not yet, and a hard error today:

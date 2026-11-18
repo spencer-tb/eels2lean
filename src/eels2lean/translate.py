@@ -10,6 +10,10 @@ A function that only computes returns `Except Exc α`. A function that
 assigns to a field of a dataclass parameter returns `EStateM Exc σ α`, with
 that parameter as the state `σ`, so a write made before a raise is kept.
 
+A union of dataclasses named at module level becomes an inductive type with
+one constructor per class, and `isinstance` on it becomes a `match`. Any
+other union becomes `Option` when one side is `None`, and `⊕` otherwise.
+
 A `while` becomes a function of its own that counts its steps down from
 `fuel`, since Lean needs every function to end. A function with a `while`,
 or one that calls such a function, takes `fuel` as its first argument.
@@ -19,6 +23,7 @@ and line. The translator never guesses.
 """
 
 import ast
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,13 +33,18 @@ LEAN_ROOT = "Eels"
 # Types from `ethereum_types.numeric`, mapped to runtime types.
 NUMERIC = {
     "ethereum_types.numeric.Uint": "Uint",
+    "ethereum_types.numeric.U8": "U8",
     "ethereum_types.numeric.U64": "U64",
     "ethereum_types.numeric.U256": "U256",
 }
-FIXED_BITS = {"U64": 64, "U256": 256}
+FIXED_BITS = {"U8": 8, "U64": 64, "U256": 256}
+# Types from `ethereum_types.bytes`: `Bytes`, and `Bytes0` to `Bytes256`.
+BYTES = "ethereum_types.bytes.Bytes"
+FIXED_BYTES = re.compile(r"Bytes(\d+)")
 BUILTIN_TYPES = {"int": "Int", "bool": "Bool"}
 LEAN_TYPES = {
-    "Uint": "Uint", "U64": "U64", "U256": "U256", "None": "Unit",
+    "Uint": "Uint", "U8": "U8", "U64": "U64", "U256": "U256", "None": "Unit",
+    "Bytes": "Bytes",
     **BUILTIN_TYPES,
 }
 
@@ -42,6 +52,7 @@ LEAN_TYPES = {
 # in step: the Lean build fails on a name the runtime does not have.
 EXCEPTIONS = (
     "AssertionError", "OverflowError", "ZeroDivisionError", "OutOfGasError",
+    "InvalidSignatureError",
 )
 
 # The step limit of a `while`, and of every function that reaches one.
@@ -216,6 +227,13 @@ class Translator:
         self.signatures: dict[str, Signature] = {}
         self.aliases: dict[str, str] = {}
         self.records: dict[str, list[tuple[str, str]]] = {}
+        # Named unions of dataclasses, by the classes they hold.
+        self.unions: dict[str, list[str]] = {}
+        # Types written in place, such as `U64 | None`: their Lean and the
+        # declarations they need.
+        self.compound: dict[str, tuple[str, set[str]]] = {}
+        # The type `X` inside each `X | None`.
+        self.optionals: dict[str, str] = {}
         self.in_progress: set[str] = set()
 
     # Names and types.
@@ -238,20 +256,80 @@ class Translator:
             and node.value.id == "Final"
         ):
             return self.py_type(module, node.slice)
+        if isinstance(node, ast.Constant) and node.value is None:
+            return "None"
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return self.union_type(module, node)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            fq = self.global_fq(module, node.value.id)
+            elements = node.slice
+            if (
+                (node.value.id == "tuple" or fq == "typing.Tuple")
+                and isinstance(elements, ast.Tuple)
+                and len(elements.elts) == 2
+                and isinstance(elements.elts[1], ast.Constant)
+                and elements.elts[1].value is Ellipsis
+            ):
+                inner = self.py_type(module, elements.elts[0])
+                key = f"Tuple[{inner}, ...]"
+                self.compound[key] = (
+                    f"(List {self.lean_type(inner)})", self.type_deps(inner)
+                )
+                return key
         if isinstance(node, ast.Name):
             if node.id in BUILTIN_TYPES:
                 return node.id
             fq = self.global_fq(module, node.id)
             if fq in NUMERIC:
                 return NUMERIC[fq]
+            if fq is not None and fq.startswith(BYTES):
+                size = fq[len(BYTES):]
+                if size == "" or size.isdigit():
+                    return fq.rpartition(".")[2]
             if fq is not None:
                 self.require(fq)
                 fq = self.canonical(fq)
-                if fq in self.aliases or fq in self.records:
+                if fq in self.aliases or fq in self.records or fq in self.unions:
                     return fq
         raise Unsupported(
             f"{module.where(node)}: type annotation {ast.unparse(node)}"
         )
+
+    def union_type(self, module: Module, node: ast.BinOp) -> str:
+        """Translate `A | B | ...` written in place."""
+        sides: list[ast.expr] = [node]
+        while any(isinstance(n, ast.BinOp) for n in sides):
+            sides = [
+                part
+                for n in sides
+                for part in (
+                    (n.left, n.right)
+                    if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr)
+                    else (n,)
+                )
+            ]
+            if any(isinstance(n, ast.BinOp) and not isinstance(n.op, ast.BitOr)
+                   for n in sides):
+                raise Unsupported(f"{module.where(node)}: union {ast.unparse(node)}")
+        members = [self.py_type(module, side) for side in sides]
+        others = [m for m in members if m != "None"]
+        if len(others) == 1 and len(members) == 2:
+            key = f"{others[0]} | None"
+            self.optionals[key] = others[0]
+            self.compound[key] = (
+                f"(Option {self.lean_type(others[0])})",
+                self.type_deps(others[0]),
+            )
+            return key
+        if len(others) != len(members) or len(set(members)) != len(members):
+            raise Unsupported(f"{module.where(node)}: union {ast.unparse(node)}")
+        key = " | ".join(members)
+        deps: set[str] = set()
+        for m in members:
+            deps |= self.type_deps(m)
+        lean = " ⊕ ".join(self.lean_type(m) for m in members)
+        self.compound[key] = (f"({lean})", deps)
+        return key
 
     def base(self, py_type: str) -> str:
         """Follow `NewType` aliases down to a runtime type."""
@@ -263,6 +341,11 @@ class Translator:
         """Return the Lean name of a Python type key."""
         if py_type in LEAN_TYPES:
             return LEAN_TYPES[py_type]
+        if py_type in self.compound:
+            return self.compound[py_type][0]
+        size = FIXED_BYTES.fullmatch(py_type)
+        if size:
+            return f"(FixedBytes {size.group(1)})"
         return py_type
 
     def canonical(self, fq: str) -> str:
@@ -317,12 +400,57 @@ class Translator:
             self.aliases[fq] = base
             lean = f"/-- `{name} = NewType(\"{name}\", ...)` -/\nabbrev {ident(name)} := {self.lean_type(base)}\n"
             return Item(fq, module.name, lean, self.type_deps(base))
+        if isinstance(call, (ast.Name, ast.Attribute)):
+            return self.type_alias(module, node, name)
+        if isinstance(call, ast.BinOp) and isinstance(call.op, ast.BitOr):
+            return self.named_union(module, node, name)
         raise Unsupported(f"{module.where(node)}: module-level {name}")
+
+    def type_alias(self, module: Module, node: ast.Assign, name: str) -> Item:
+        """Translate `X = Y` for a type `Y`. Python reads `X` as `Y`."""
+        try:
+            base = self.py_type(module, node.value)
+        except Unsupported:
+            raise Unsupported(f"{module.where(node)}: module-level {name}") from None
+        fq = f"{module.name}.{name}"
+        self.aliases[fq] = base
+        target = ast.unparse(node.value)
+        lean = f"/-- `{name} = {target}` -/\nabbrev {ident(name)} := {self.lean_type(base)}\n"
+        return Item(fq, module.name, lean, self.type_deps(base))
+
+    def named_union(self, module: Module, node: ast.Assign, name: str) -> Item:
+        """
+        Translate `X = A | B | ...` of dataclasses into an inductive type.
+
+        Each constructor has the name of its class and holds one value of
+        it, so `isinstance` becomes a `match` on the constructor.
+        """
+        members = self.union_type(module, node.value).split(" | ")
+        if not all(m in self.records for m in members):
+            raise Unsupported(
+                f"{module.where(node)}: union {name} of other than dataclasses"
+            )
+        fq = f"{module.name}.{name}"
+        self.unions[fq] = members
+        short = [m.rpartition(".")[2] for m in members]
+        arms = "".join(
+            f"  | {ident(s)} (value : {self.lean_type(m)})\n"
+            for s, m in zip(short, members)
+        )
+        lean = (
+            f"/-- `{name} = {' | '.join(short)}` -/\n"
+            f"inductive {ident(name)} where\n{arms}"
+        )
+        return Item(fq, module.name, lean, set(members))
 
     def type_deps(self, py_type: str) -> set[str]:
         """Return the declarations a type key depends on."""
         if py_type in self.aliases or py_type in self.records:
             return {py_type}
+        if py_type in self.unions:
+            return {py_type}
+        if py_type in self.compound:
+            return set(self.compound[py_type][1])
         return set()
 
     def record(self, module: Module, cls: ast.ClassDef) -> Item:
@@ -334,7 +462,11 @@ class Translator:
         ]
         if len(decorators) != len(cls.decorator_list) or (
             "dataclasses.dataclass" not in decorators
-        ) or not set(decorators) <= {"dataclasses.dataclass", "typing.final"}:
+        ) or not set(decorators) <= {
+            "dataclasses.dataclass",
+            "typing.final",
+            "ethereum_types.frozen.slotted_freezable",
+        }:
             raise Unsupported(f"{module.where(cls)}: class {cls.name}")
         if cls.bases or cls.keywords:
             raise Unsupported(f"{module.where(cls)}: base classes of {cls.name}")
@@ -797,6 +929,8 @@ class FunctionTranslator:
         self.block_locals: list[set[str]] = []
         # The functions its `while` loops became.
         self.loops: list[str] = []
+        # The type the function returns.
+        self.returns = "None"
 
     def fail(self, node: ast.AST, what: str) -> Unsupported:
         return Unsupported(f"{self.module.where(node)}: {what}")
@@ -828,6 +962,7 @@ class FunctionTranslator:
             returns = "None"
         else:
             returns = self.t.py_type(self.module, node.returns)
+        self.returns = returns
         self.state = self.expr.state = self.find_state(params)
         self.t.signatures[fq] = Signature(params, returns, self.state)
         names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
@@ -975,9 +1110,7 @@ class FunctionTranslator:
         if isinstance(node, ast.Pass):
             return ""
         if isinstance(node, ast.Return):
-            if node.value is None:
-                return f"{pad}return ()\n"
-            return f"{pad}return {self.expr.expr(node.value)}\n"
+            return f"{pad}return {self.returned(node)}\n"
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if len(targets) != 1:
@@ -1003,6 +1136,8 @@ class FunctionTranslator:
             if isinstance(target, ast.Attribute):
                 return self.store(node, target, value, depth)
             return self.assign(node, target.id, value, depth)
+        if isinstance(node, ast.If) and self.narrowed(node) is not None:
+            return self.match(node, depth)
         if isinstance(node, ast.If):
             test = self.expr.expr(node.test)
             before = self.writes
@@ -1021,6 +1156,97 @@ class FunctionTranslator:
             test = self.expr.expr(node.test)
             return f"{pad}if !{test} then\n{pad}  throw Exc.AssertionError\n"
         raise self.fail(node, f"statement {type(node).__name__}")
+
+    def returned(self, node: ast.Return) -> str:
+        """Return Lean for the value of a `return`, as `some x` for `X | None`."""
+        value = node.value
+        if value is None or (
+            isinstance(value, ast.Constant) and value.value is None
+        ):
+            if self.returns == "None":
+                return "()"
+            if self.returns in self.t.optionals:
+                return "none"
+            raise self.fail(node, "return of None")
+        rendered = self.expr.expr(value)
+        inner = self.t.optionals.get(self.returns)
+        if inner is not None and (
+            self.t.base(self.expr.type_of(value)) == self.t.base(inner)
+        ):
+            return f"(some {rendered})"
+        return rendered
+
+    def narrowed(self, node: ast.If) -> tuple[str, str] | None:
+        """
+        Return the local and the class of `if isinstance(local, Class):`.
+
+        The local must hold a named union and the class must be one of its
+        members. Return `None` when the test is no `isinstance`.
+        """
+        test = node.test
+        if not (
+            isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Name)
+            and test.func.id == "isinstance"
+        ):
+            return None
+        if test.keywords or len(test.args) != 2:
+            raise self.fail(test, "isinstance")
+        value, cls = test.args
+        if not (
+            isinstance(value, ast.Name)
+            and value.id in self.locals
+            and isinstance(cls, ast.Name)
+        ):
+            raise self.fail(test, "isinstance")
+        union = self.t.base(self.locals[value.id])
+        fq = self.t.global_fq(self.module, cls.id)
+        member = self.t.canonical(fq) if fq is not None else None
+        if union not in self.t.unions or member not in self.t.unions[union]:
+            raise self.fail(test, "isinstance of other than a named union")
+        if value.id == self.state or value.id in self.mutable:
+            raise self.fail(test, f"isinstance of {value.id}, which changes")
+        return value.id, member
+
+    def match(self, node: ast.If, depth: int) -> str:
+        """
+        Translate `if isinstance(x, A):` on a named union into a `match`.
+
+        The `if` branch is the arm of `A`, where `x` is an `A`. As mypy
+        narrows it, the `else` branch sees `x` as each other class of the
+        union in turn, so it becomes one arm per other class. Without an
+        `else`, the other classes do nothing.
+        """
+        found = self.narrowed(node)
+        assert found is not None
+        name, member = found
+        kind = self.locals[name]
+        members = self.t.unions[self.t.base(kind)]
+        if len(members) > 1 and any(
+            isinstance(n, ast.While) for s in node.orelse for n in ast.walk(s)
+        ):
+            raise self.fail(node, "while in the else of an isinstance")
+        pad = "  " * depth
+        var = ident(name)
+        out = f"{pad}match {var} with\n"
+        before = after = self.writes
+        for m in members:
+            body = node.body if m == member else node.orelse
+            if not body:
+                continue
+            self.writes = before
+            self.locals[name] = m
+            try:
+                arm = self.block(body, depth + 2)
+            finally:
+                self.locals[name] = kind
+            after = max(after, self.writes)
+            short = m.rpartition(".")[2]
+            out += f"{pad}  | .{ident(short)} {var} =>\n{arm}"
+        if not node.orelse and len(members) > 1:
+            out += f"{pad}  | _ => pure ()\n"
+        self.writes = after
+        return out
 
     def loop(self, node: ast.While, depth: int) -> str:
         """

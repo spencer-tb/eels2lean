@@ -14,8 +14,11 @@ The arithmetic follows `ethereum_types.numeric`:
 
 - `Uint` is unbounded and never negative. `a - b` below zero raises
   `OverflowError`, and `//` or `%` by zero raises `ZeroDivisionError`.
-- `U64` and `U256` are fixed width. Any result out of range raises
+- `U8`, `U64` and `U256` are fixed width. Any result out of range raises
   `OverflowError`.
+
+`Bytes` and `Bytes0` to `Bytes256` from `ethereum_types.bytes` are byte
+arrays, the latter of a fixed size.
 -/
 
 namespace EelsRuntime
@@ -35,6 +38,7 @@ inductive Exc where
   | OverflowError
   | ZeroDivisionError
   | OutOfGasError
+  | InvalidSignatureError
   | OutOfFuel
   deriving Repr, BEq, DecidableEq, Inhabited
 
@@ -44,6 +48,7 @@ def Exc.name : Exc → String
   | .OverflowError => "OverflowError"
   | .ZeroDivisionError => "ZeroDivisionError"
   | .OutOfGasError => "OutOfGasError"
+  | .InvalidSignatureError => "InvalidSignatureError"
   | .OutOfFuel => "OutOfFuel"
 
 /-- Raise the Python exception `e`. -/
@@ -78,6 +83,9 @@ structure Fixed (bits : Nat) where
   val : Nat
   lt : val < 2 ^ bits
   deriving DecidableEq
+
+/-- `ethereum_types.numeric.U8`. -/
+abbrev U8 := Fixed 8
 
 /-- `ethereum_types.numeric.U64`. -/
 abbrev U64 := Fixed 64
@@ -132,6 +140,14 @@ instance (a b : Fixed bits) : Decidable (a ≤ b) := inferInstanceAs (Decidable 
 instance : ToString (Fixed bits) := ⟨fun a => toString a.val⟩
 
 end Fixed
+
+/-- `ethereum_types.bytes.Bytes`: bytes of any length. -/
+abbrev Bytes := ByteArray
+
+/-- `ethereum_types.bytes.Bytes0` to `Bytes256`: exactly `n` bytes. -/
+structure FixedBytes (n : Nat) where
+  data : ByteArray
+  size : data.size = n
 
 namespace Int
 
