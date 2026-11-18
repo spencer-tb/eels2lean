@@ -9,3 +9,7 @@ lean/Eels/
 lean/Eels.lean
 lean/EelsCheck.lean
 lean/eels-check.json
+lean/ChainIdPre/
+lean/ChainIdPre.lean
+lean/ChainIdPost/
+lean/ChainIdPost.lean

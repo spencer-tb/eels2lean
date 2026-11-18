@@ -13,3 +13,14 @@ name = "Eels"
 [[lean_exe]]
 name = "eels-check"
 root = "EelsCheck"
+
+# The chain_id demo: chain_id generated from EELS before and after
+# execution-specs#3828 (not committed), and the proofs about it.
+[[lean_lib]]
+name = "ChainIdPre"
+
+[[lean_lib]]
+name = "ChainIdPost"
+
+[[lean_lib]]
+name = "ChainIdProofs"
