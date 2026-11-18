@@ -464,6 +464,9 @@ class ExprTranslator:
             if fq in self.t.constants:
                 return self.t.constants[fq].py_type
         if isinstance(node, ast.Attribute):
+            kind = self.max_value(node)
+            if kind is not None:
+                return kind
             field = self.record_field(node)
             if field is not None:
                 return field
@@ -518,6 +521,18 @@ class ExprTranslator:
             raise self.fail(node, "attribute of a local")
         return None
 
+    def max_value(self, node: ast.Attribute) -> str | None:
+        """Return `U64` for `U64.MAX_VALUE`, and likewise for each width."""
+        if (
+            node.attr == "MAX_VALUE"
+            and isinstance(node.value, ast.Name)
+            and node.value.id not in self.locals
+        ):
+            kind = NUMERIC.get(self.t.global_fq(self.module, node.value.id) or "")
+            if kind in FIXED_BITS:
+                return kind
+        return None
+
     # Name resolution.
 
     def canonical(self, fq: str) -> str:
@@ -570,6 +585,10 @@ class ExprTranslator:
                 return self.constant_ref(node, fq)
             raise self.fail(node, "unknown name")
         if isinstance(node, ast.Attribute):
+            kind = self.max_value(node)
+            if kind is not None:
+                bits = FIXED_BITS[kind]
+                return f"(⟨2 ^ {bits} - 1, by decide⟩ : {RUNTIME}.Fixed {bits})"
             if self.record_field(node) is not None:
                 return f"{ident(node.value.id)}.{ident(node.attr)}"
             fq = self.attr_fq(node)
@@ -623,6 +642,7 @@ class ExprTranslator:
             names = {
                 ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul",
                 ast.FloorDiv: "floorDiv", ast.Mod: "mod", ast.Pow: "pow",
+                ast.RShift: "shr",
             }
             if op in names:
                 return f"(← {RUNTIME}.Fixed.{names[op]} {left} {right})"

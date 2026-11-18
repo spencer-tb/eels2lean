@@ -121,6 +121,10 @@ def mod (a b : Fixed bits) : Except Exc (Fixed bits) :=
 def pow (a b : Fixed bits) : Except Exc (Fixed bits) :=
   ofNat bits (a.val ^ b.val)
 
+/-- `a >> b`. Never out of range: `ethereum_types` shifts the number. -/
+def shr (a b : Fixed bits) : Except Exc (Fixed bits) :=
+  ofNat bits (a.val >>> b.val)
+
 instance : LT (Fixed bits) := ⟨fun a b => a.val < b.val⟩
 instance : LE (Fixed bits) := ⟨fun a b => a.val ≤ b.val⟩
 instance (a b : Fixed bits) : Decidable (a < b) := inferInstanceAs (Decidable (a.val < b.val))
