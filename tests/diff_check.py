@@ -13,7 +13,10 @@ dataclass after the call, whether it returned or raised. Both sides must
 agree on every input.
 
 An input is one integer per number, in parameter order. A dataclass
-parameter takes one integer per field.
+parameter takes one integer per field. A named union of dataclasses takes
+one integer that picks the class, then one per number field of it. Its
+fields that are no number get a fixed value, such as empty bytes. A result
+of `None` prints as `ok` and no number.
 
 The Lean of a `while` has a step limit, which Python does not. An input on
 which the Lean runs out of steps is left out: the Python loop may run for
@@ -29,7 +32,8 @@ import sys
 from pathlib import Path
 
 BOUNDARIES = sorted({
-    0, 1, 2, 3, 31, 32, 33, 63, 64, 65, 127, 128, 511, 512, 513,
+    0, 1, 2, 3, 27, 28, 31, 32, 33, 34, 35, 36, 63, 64, 65, 127, 128, 511,
+    512, 513, 2**65 + 34, 2**65 + 35,
     2**16, 2**32 - 1, 2**32, 2**63 - 1, 2**63, 2**64 - 1, 2**64, 2**64 + 1,
     2**128, 2**255, 2**256 - 1, 2**256, 2**300,
 })
@@ -74,6 +78,41 @@ def convert(kind: str, number: int):
     return number if kind == "int" else getattr(numeric, kind)(number)
 
 
+def default(spec: dict):
+    """Return the fixed value of a field that is no number."""
+    from ethereum_types import bytes as eth_bytes
+
+    if "bytes" in spec:
+        size = spec["bytes"]
+        if size is None:
+            return eth_bytes.Bytes(b"")
+        return getattr(eth_bytes, f"Bytes{size}")(bytes(size))
+    if "tuple" in spec:
+        return ()
+    if "none" in spec:
+        return None
+    raise ValueError(spec)
+
+
+def build(member: dict, numbers: list[int]):
+    """Return a dataclass of a union, raising as its numbers would."""
+    numbers_left = iter(numbers)
+    return find(member["class"])(**{
+        f["name"]: (
+            convert(f["kind"], next(numbers_left)) if "kind" in f
+            else default(f["default"])
+        )
+        for f in member["fields"]
+    })
+
+
+def kinds(param: dict) -> list[str]:
+    """Return the kind of each integer a parameter takes."""
+    if "union" in param:
+        return ["Uint"] * (1 + param["width"])
+    return [f["kind"] for f in param.get("fields", [param])]
+
+
 def run_python(entry: dict, args: tuple[int, ...]) -> str:
     fn = find(entry["function"])
     numbers = iter(args)
@@ -82,7 +121,12 @@ def run_python(entry: dict, args: tuple[int, ...]) -> str:
     values = []
     state = None
     for param in entry["params"]:
-        if "class" in param:
+        if "union" in param:
+            taken = [next(numbers) for _ in range(1 + param["width"])]
+            member = param["union"][taken[0] % len(param["union"])]
+            # Built inside the call, so a number out of range raises there.
+            values.append(lambda m=member, n=taken[1:]: build(m, n))
+        elif "class" in param:
             value = find(param["class"])(
                 *(convert(f["kind"], next(numbers)) for f in param["fields"])
             )
@@ -96,7 +140,12 @@ def run_python(entry: dict, args: tuple[int, ...]) -> str:
     try:
         result = fn(*(value() for value in values))
         names = entry["fields"]
-        results = [result] if names is None else [getattr(result, n) for n in names]
+        if result is None:
+            results = []
+        elif names is None:
+            results = [result]
+        else:
+            results = [getattr(result, n) for n in names]
         out = ["ok", *(str(int(n)) for n in results)]
     except Exception as error:  # noqa: BLE001, every exception is a result
         out = ["err", type(error).__name__]
@@ -122,10 +171,9 @@ def main() -> int:
     failures = 0
     for entry in manifest:
         function = entry["function"]
-        kinds = [
-            f["kind"] for p in entry["params"] for f in p.get("fields", [p])
-        ]
-        cases = inputs(kinds, rng, args.random)
+        cases = inputs(
+            [k for p in entry["params"] for k in kinds(p)], rng, args.random
+        )
         stdin = "".join(
             f"{function} {' '.join(map(str, c))}\n" for c in cases
         )

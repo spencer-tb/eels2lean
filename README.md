@@ -100,12 +100,12 @@ Covered now, and in the differential check:
   take one. Eleven change it. One of them, `withhold_create_gas`, is where
   `CREATE` and `CREATE2` apply the 63/64 rule.
 - `taylor_exponential`, and `calculate_blob_gas_price` which calls it.
+- `chain_id` in `transactions.py`, which takes the `Transaction` union and
+  returns `U64 | None`. The check picks the class with one integer and
+  gives the fields that are no number a fixed value, such as empty bytes.
 - `tests/cases`: functions written for the check, for behavior that no
   checked EELS function reaches. Today there is one, a write followed by a
   raise.
-
-`chain_id` builds and is in `tests/expected`, but not yet in the
-differential check, which cannot build a `Transaction` input.
 
 `tests/expected` holds the Lean generated for the gas meter, the loop and
 `chain_id`, so a change to the translator shows up as a change to them in

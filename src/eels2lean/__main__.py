@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 from .translate import (
+    FIXED_BYTES,
     LEAN_ROOT,
     Project,
     Translator,
@@ -44,7 +45,7 @@ def write_modules(out: Path, sources: dict[str, str], root: str) -> None:
 
 
 # Kinds of number the differential check can pass in and read back.
-CHECK_BITS = {"U64": 64, "U256": 256}
+CHECK_BITS = {"U8": 8, "U64": 64, "U256": 256}
 CHECK_FIELDS = ("Uint", "int")
 CHECK_PARAMS = (*CHECK_FIELDS, *CHECK_BITS)
 # The step limit the check gives a function with a `while`.
@@ -94,7 +95,36 @@ def main : IO Unit := do
 
 def check_number(lean: str, kind: str) -> str:
     """Return Lean for the integer the check prints for `lean`."""
-    return f"Int.ofNat {lean}" if kind == "Uint" else lean
+    if kind == "Uint":
+        return f"Int.ofNat {lean}"
+    if kind in CHECK_BITS:
+        return f"Int.ofNat {lean}.val"
+    return lean
+
+
+def check_default(t: Translator, py_type: str) -> tuple[str, dict] | None:
+    """
+    Return a fixed value of a field that is no number, in Lean and for the
+    manifest: empty bytes, zero bytes of a fixed size, an empty tuple,
+    `None`, or such a value of the first type of a union.
+    """
+    kind = t.base(py_type)
+    if kind == "Bytes":
+        return "ByteArray.empty", {"bytes": None}
+    size = FIXED_BYTES.fullmatch(kind)
+    if size:
+        n = int(size.group(1))
+        return f"⟨⟨Array.replicate {n} 0⟩, by decide⟩", {"bytes": n}
+    if kind.startswith("Tuple["):
+        return "[]", {"tuple": True}
+    if kind in t.optionals:
+        return "none", {"none": True}
+    if kind in t.compound and " | " in kind:
+        first = check_default(t, kind.split(" | ")[0])
+        if first is None:
+            return None
+        return f"(.inl {first[0]})", first[1]
+    return None
 
 
 def check_arm(t: Translator, fq: str) -> tuple[str, dict] | None:
@@ -107,8 +137,13 @@ def check_arm(t: Translator, fq: str) -> tuple[str, dict] | None:
             return None
         values = [check_number(f"r.{ident(n)}", kind) for n, kind in fields]
         names: list[str] | None = [n for n, _ in fields]
-    elif result in CHECK_FIELDS:
+    elif result in CHECK_PARAMS:
         values = [check_number("r", result)]
+        names = None
+    elif result in t.optionals and t.base(t.optionals[result]) in CHECK_PARAMS:
+        # `None` prints as no number at all.
+        inner = t.base(t.optionals[result])
+        values = None
         names = None
     elif result == "None":
         values = []
@@ -148,6 +183,13 @@ def check_arm(t: Translator, fq: str) -> tuple[str, dict] | None:
                 "class": kind,
                 "fields": [{"name": n, "kind": k} for n, k in fields],
             })
+        elif kind in t.unions:
+            found = check_union(t, kind, inputs)
+            if found is None:
+                return None
+            lines += found[0]
+            args.append(found[1])
+            params.append({"name": name, **found[2]})
         elif kind in CHECK_BITS:
             lines.append(
                 f"let v{len(inputs)} ← "
@@ -163,8 +205,15 @@ def check_arm(t: Translator, fq: str) -> tuple[str, dict] | None:
     if sig.fuel:
         args.insert(0, str(CHECK_FUEL))
     call = " ".join([".".join(ident(p) for p in fq.split(".")), *args])
-    lines.append(f"let r ← {call}" if values else call)
-    lines.append(f"return [{', '.join(values)}]")
+    if values is None:
+        lines.append(f"let r ← {call}")
+        lines.append(
+            f"return (match r with | some x => [{check_number('x', inner)}]"
+            " | none => [])"
+        )
+    else:
+        lines.append(f"let r ← {call}" if values else call)
+        lines.append(f"return [{', '.join(values)}]")
     body = "".join(f"\n      {line}" for line in lines)
     pattern = f'  | "{fq}", [{", ".join(inputs)}] => some '
     if state:
@@ -184,13 +233,82 @@ def check_arm(t: Translator, fq: str) -> tuple[str, dict] | None:
     return arm, entry
 
 
+def check_union(
+    t: Translator, kind: str, inputs: list[str]
+) -> tuple[list[str], str, dict] | None:
+    """
+    Return the lines that build a value of a named union, its Lean, and
+    its manifest entry.
+
+    The first integer picks the class, modulo the number of classes. One
+    integer per number field follows, as many as the class with the most
+    of them needs. A field that is no number gets a fixed value.
+    """
+    members = []
+    for member in t.unions[kind]:
+        fields = []
+        for name, py_type in t.records[member]:
+            field_kind = t.base(py_type)
+            if field_kind in CHECK_PARAMS:
+                fields.append((name, field_kind, None))
+                continue
+            default = check_default(t, py_type)
+            if default is None:
+                return None
+            fields.append((name, None, default))
+        members.append((member, fields))
+    width = max(sum(k is not None for _, k, _ in f) for _, f in members)
+    first = len(inputs)
+    inputs += [f"a{first + i}" for i in range(width + 1)]
+    tag, numbers = inputs[first], inputs[first + 1:]
+
+    lean_kind = ".".join(ident(p) for p in kind.split("."))
+    arms = []
+    entries = []
+    for index, (member, fields) in enumerate(members):
+        body = []
+        assigned = []
+        used = iter(numbers)
+        entry_fields = []
+        for name, field_kind, default in fields:
+            if field_kind is None:
+                assigned.append(f"{ident(name)} := {default[0]}")
+                entry_fields.append({"name": name, "default": default[1]})
+                continue
+            number = next(used)
+            if field_kind in CHECK_BITS:
+                body.append(
+                    f"let {number}' ← EelsRuntime.Fixed.ofNat "
+                    f"{CHECK_BITS[field_kind]} {number}.toNat"
+                )
+                assigned.append(f"{ident(name)} := {number}'")
+            elif field_kind == "Uint":
+                assigned.append(f"{ident(name)} := {number}.toNat")
+            else:
+                assigned.append(f"{ident(name)} := {number}")
+            entry_fields.append({"name": name, "kind": field_kind})
+        short = ident(member.rpartition(".")[2])
+        body.append(f"pure ({lean_kind}.{short} {{ {', '.join(assigned)} }})")
+        pattern = "_" if index == len(members) - 1 else str(index)
+        arms.append(
+            f"| {pattern} => do\n"
+            + "".join(f"          {line}\n" for line in body)
+        )
+        entries.append({"class": member, "fields": entry_fields})
+    value = f"u{first}"
+    lines = [f"let {value} ← (match {tag}.toNat % {len(members)} with\n"
+             + "".join(f"        {arm}" for arm in arms).rstrip("\n") + ")"]
+    return lines, value, {"union": entries, "width": width}
+
+
 def write_check(out: Path, t: Translator, functions: list[str]) -> None:
     """
     Write `EelsCheck.lean` and `eels-check.json`.
 
-    A function takes part when each parameter is a `Uint`, `U64`, `U256`
-    or `int` based number, or a dataclass of `Uint` and `int` based
-    numbers, and its result is `None`, such a number or such a dataclass.
+    A function takes part when each parameter is a `Uint`, `U8`, `U64`,
+    `U256` or `int` based number, a dataclass of `Uint` and `int` based
+    numbers, or a named union of dataclasses. Its result is `None`, such a
+    number, such a number or `None`, or such a dataclass.
 
     The check passes plain integers in parameter order, one per number
     and one per field of a dataclass. It prints the result's numbers.
